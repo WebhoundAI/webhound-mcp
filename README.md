@@ -67,6 +67,15 @@ ChatGPT developer mode:
 
 The ChatGPT app can accept attachments and return normal MCP status, output, working documents, claims, and sources. Webhound deliberately does not attach a custom interactive panel beneath tool calls. Public distribution still requires plugin submission through OpenAI.
 
+Replit Agent:
+
+[![Add Webhound to Replit](https://replit.com/badge?caption=Add%20Webhound%20MCP)](https://replit.com/integrations?mcp=eyJkaXNwbGF5TmFtZSI6IldlYmhvdW5kIiwiYmFzZVVybCI6Imh0dHBzOi8vYXBpLndlYmhvdW5kLmFpL2FwaS92Mi9tY3AiLCJoZWFkZXJzIjpbXX0%3D)
+
+The install link supplies only Webhound's hosted MCP URL. Replit discovers
+Webhound's OAuth metadata and each person authorizes their own account; the
+payload contains no API key, bearer token, OAuth client secret, or shared
+publisher credential.
+
 ## Install
 
 Create a Webhound API key, then add the stdio server to your agent:
