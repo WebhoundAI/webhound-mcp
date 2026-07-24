@@ -1,0 +1,49 @@
+{
+  "name": "webhound-mcp",
+  "version": "0.4.2",
+  "mcpName": "ai.webhound/webhound",
+  "description": "MCP server that lets agents run Webhound reports and datasets as a research sidecar, save shared sidecar notes, diagnose failures, and read cited outputs.",
+  "bin": {
+    "webhound-mcp": "bin/server.mjs"
+  },
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "bin/",
+    "core/",
+    "README.md"
+  ],
+  "scripts": {
+    "self-test": "node bin/server.mjs --self-test",
+    "mcp:self-test": "node bin/server.mjs --self-test"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^3.23.0"
+  },
+  "overrides": {
+    "@hono/node-server": "2.0.11",
+    "body-parser": "2.3.0",
+    "fast-uri": "3.1.4",
+    "hono": "4.12.31"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "agent",
+    "research",
+    "deep-research",
+    "webhound",
+    "claude",
+    "cursor",
+    "codex"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/WebhoundAI/webhound-mcp"
+  },
+  "homepage": "https://www.webhound.ai/mcp-setup"
+}
