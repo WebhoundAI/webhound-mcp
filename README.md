@@ -105,6 +105,17 @@ WEBHOUND_KEY = "wh_..."
 
 Cursor and Claude Desktop use the JSON shape above.
 
+Cline CLI:
+
+```bash
+cline mcp add webhound \
+  --transport streamable-http \
+  --header "Authorization: Bearer wh_..." \
+  --yes \
+  https://api.webhound.ai/api/v2/mcp
+```
+
+You can also use the local stdio JSON shape above in Cline's MCP settings.
 After saving local stdio config, restart the agent session or open a new one
 if the Webhound tools do not appear. Many clients load MCP servers only when a
 session starts.
@@ -126,8 +137,8 @@ VS Code:
 }
 ```
 
-Use the same stdio server shape for Windsurf and Cline. Windsurf commonly
-stores it in `~/.codeium/windsurf/mcp_config.json`.
+Use the same stdio server shape for Windsurf. Windsurf commonly stores it in
+`~/.codeium/windsurf/mcp_config.json`.
 
 ## Hound
 
