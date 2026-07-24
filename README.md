@@ -117,7 +117,8 @@ VS Code:
 }
 ```
 
-Use the same stdio server shape for Windsurf, Cline, and Roo Code. Windsurf commonly stores it in `~/.codeium/windsurf/mcp_config.json`; Roo Code supports global MCP settings or project-level `.roo/mcp.json`.
+Use the same stdio server shape for Windsurf and Cline. Windsurf commonly
+stores it in `~/.codeium/windsurf/mcp_config.json`.
 
 ## Defaults
 
