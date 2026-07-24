@@ -76,6 +76,15 @@ Webhound's OAuth metadata and each person authorizes their own account; the
 payload contains no API key, bearer token, OAuth client secret, or shared
 publisher credential.
 
+n8n:
+
+Install [`n8n-nodes-webhound`](https://www.npmjs.com/package/n8n-nodes-webhound)
+through **Settings → Community Nodes**. It exposes native report, dataset,
+watch/wait, output, evidence-pack, account, and help operations. Spend-bearing
+starts require both an explicit dollar budget and a separate confirmation.
+Each n8n user or workspace supplies its own encrypted Webhound API key; the
+package contains no shared publisher credential.
+
 ## Install
 
 Create a Webhound API key, then add the stdio server to your agent:
