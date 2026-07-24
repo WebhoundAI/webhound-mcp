@@ -46,7 +46,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/WebhoundAI/webhound-mcp"
+    "url": "git+https://github.com/WebhoundAI/webhound-mcp.git"
   },
   "bugs": {
     "url": "https://github.com/WebhoundAI/webhound-mcp/issues"
