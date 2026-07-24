@@ -44,6 +44,10 @@ for GitHub Copilot, Claude Code, Cursor, and Kiro:
 Both MCP files point to Webhound's production remote endpoint and contain no
 API key, bearer token, static OAuth client, or shared publisher credential.
 Every person authorizes their own Webhound account through OAuth.
+The `oauthScopes` entry in `mcp.json` is required by Kiro so it requests
+Webhound's two supported scopes instead of Kiro's unrelated defaults. Cursor
+ignores that Kiro-specific field and completes OAuth from Webhound's published
+authorization metadata.
 
 The shared skill teaches each client the same public contract:
 
