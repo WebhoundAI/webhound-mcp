@@ -2,7 +2,7 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "ai.webhound/webhound",
   "title": "Webhound",
-  "description": "Budgeted reports and datasets with Hound, Webhound's DeepSeek V4 Pro + GPT-5.4 research harness, plus cited outputs and inspectable evidence.",
+  "description": "Budgeted reports and datasets with Hound, Webhound's DeepSeek V4 Pro + GPT-5.4 research harness.",
   "version": "0.4.3",
   "websiteUrl": "https://www.webhound.ai",
   "icons": [
