@@ -1,0 +1,36 @@
+{
+  "name": "webhound",
+  "owner": {
+    "name": "Webhound",
+    "email": "moe@webhound.ai"
+  },
+  "metadata": {
+    "description": "Webhound plugins for budget-controlled, inspectable research.",
+    "version": "0.4.3"
+  },
+  "plugins": [
+    {
+      "name": "webhound",
+      "source": "./",
+      "description": "Run budget-controlled, inspectable Webhound investigations with Hound and retrieve the evidence behind the result.",
+      "version": "0.4.3",
+      "author": {
+        "name": "Webhound",
+        "email": "moe@webhound.ai"
+      },
+      "homepage": "https://www.webhound.ai/mcp-setup",
+      "repository": "https://github.com/WebhoundAI/webhound-mcp",
+      "license": "MIT",
+      "keywords": [
+        "webhound",
+        "research",
+        "web-research",
+        "mcp",
+        "reports",
+        "datasets",
+        "citations",
+        "evidence"
+      ]
+    }
+  ]
+}

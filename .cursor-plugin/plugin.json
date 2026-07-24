@@ -1,0 +1,28 @@
+{
+  "name": "webhound",
+  "displayName": "Webhound",
+  "version": "0.4.3",
+  "description": "Run budgeted, inspectable research with Hound, Webhound's research harness built with DeepSeek V4 Pro and GPT-5.4 across planning, execution, verification, and assembly.",
+  "author": {
+    "name": "Webhound",
+    "email": "moe@webhound.ai"
+  },
+  "publisher": "Webhound",
+  "homepage": "https://www.webhound.ai",
+  "repository": "https://github.com/WebhoundAI/webhound-mcp",
+  "license": "MIT",
+  "keywords": [
+    "research",
+    "web-research",
+    "mcp",
+    "evidence",
+    "citations",
+    "datasets"
+  ],
+  "category": "productivity",
+  "tags": [
+    "research",
+    "mcp",
+    "web"
+  ]
+}

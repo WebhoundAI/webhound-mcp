@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "webhound": {
+      "type": "http",
+      "url": "https://api.webhound.ai/api/v2/mcp"
+    }
+  }
+}

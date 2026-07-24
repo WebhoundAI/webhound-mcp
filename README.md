@@ -27,6 +27,33 @@ This package is the local stdio transport. Webhound also supports hosted MCP at:
 https://api.webhound.ai/api/v2/mcp
 ```
 
+## Client-native packages
+
+This repository also packages the hosted MCP and the `webhound-research` skill
+for GitHub Copilot, Claude Code, Cursor, and Kiro:
+
+- GitHub Copilot uses `plugin.json`, `.mcp.json`, and
+  `skills/webhound-research/SKILL.md`.
+- Claude Code uses `.claude-plugin/plugin.json`, `.mcp.json`, and the same
+  skill. The included marketplace can be tested with
+  `claude plugin marketplace add WebhoundAI/webhound-mcp`, then
+  `claude plugin install webhound@webhound`.
+- Cursor uses `.cursor-plugin/plugin.json`, `mcp.json`, and the same skill.
+- Kiro uses `POWER.md` and `mcp.json`.
+
+Both MCP files point to Webhound's production remote endpoint and contain no
+API key, bearer token, static OAuth client, or shared publisher credential.
+Every person authorizes their own Webhound account through OAuth.
+
+The shared skill teaches each client the same public contract:
+
+- Hound is Webhound's research harness, built with DeepSeek V4 Pro and GPT-5.4
+  across planning, execution, verification, and assembly.
+- The prompt defines the investigation. The dollar budget controls research
+  effort.
+- `done=true` is the completion gate. The agent then inspects the evidence pack
+  when the answer depends on the research trail.
+
 ChatGPT developer mode:
 
 1. Turn on Developer mode under Settings → Security and login.
