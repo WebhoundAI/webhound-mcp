@@ -61,6 +61,12 @@ function publicSessionRecord(value = {}) {
     model_alias: _legacyAlias,
     ...record
   } = value || {};
+  if (record.active_directive && typeof record.active_directive === 'object' && !Array.isArray(record.active_directive)) {
+    record.active_directive = publicSessionRecord(record.active_directive);
+  }
+  if (record.metadata && typeof record.metadata === 'object' && !Array.isArray(record.metadata)) {
+    record.metadata = publicSessionRecord(record.metadata);
+  }
   return record;
 }
 
