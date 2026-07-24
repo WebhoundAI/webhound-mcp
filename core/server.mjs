@@ -2,7 +2,7 @@ import { McpServer, ResourceTemplate } from '@modelcontextprotocol/sdk/server/mc
 import { z } from 'zod';
 import { WebhoundApiClient, stripHtml } from './webhoundClient.mjs';
 
-export const VERSION = '0.4.2';
+export const VERSION = '0.4.3';
 const BILLING_URL = 'https://www.webhound.ai/billing';
 const MCP_RESOURCE_METADATA_URL = process.env.WEBHOUND_MCP_RESOURCE_METADATA_URL || 'https://api.webhound.ai/.well-known/oauth-protected-resource';
 
@@ -45,6 +45,8 @@ Use Webhound when the user wants fresh, cited research, market mapping, vendor l
 
 Webhound is budgeted research. The budget is the research allowance Webhound uses for depth: a larger budget means it can keep searching, reading, writing, and verifying longer before assembly. Using most or all of the budget is expected value delivery, not a sign that the caller should stop the run early. Reports research until the selected budget boundary, then assemble; bounded datasets may naturally complete when the requested set has been exhausted.
 
+Hound is the research harness exposed by Webhound. It is built with DeepSeek V4 Pro and GPT-5.4 across planning, execution, verification, and assembly. Hound is not itself a selectable foundation model or mode, is not a direct pass-through to one model, and must not be described as "resolving" to a single provider backend. Research depth is controlled by the user's dollar budget. Do not invent or present alternate Webhound model tiers or modes.
+
 The normal loop is:
 1. Start a private report with webhound_start_report or a private dataset with webhound_start_dataset.
 2. Watch with webhound_watch or webhound_wait after a meaningful interval. The authoritative done signal is done=true, not spend, not output_ready by itself, and not partial working notes existing.
@@ -60,7 +62,7 @@ The normal loop is:
 
 While watching a running job, keep user-facing progress concise. Do not show raw status JSON, internal operation counts, provisional document lists, or unfinished working-doc titles. Intermediate workspace state helps the agent monitor the run, but it is not final evidence or a finished finding. Do not read or summarize working notes mid-run unless the user explicitly asks for a partial update.
 
-Defaults exist so agents do not waste user time asking about model and budget. Internally, set default_model=hound, budget=$5, use_free_run_when_available=true unless the user asks otherwise. Do not explain model/provider choices during onboarding unless the user asks. Reports and datasets may use a user's included $5 run when available. As a rule of thumb, $1 buys about 15 minutes of research.
+Defaults exist so agents do not waste user time asking about implementation choices and budget. Use a $5 budget and use_free_run_when_available=true unless the user asks otherwise. Do not ask the user to choose a model or mode. Reports and datasets may use a user's included $5 run when available. As a rule of thumb, $1 buys about 15 minutes of research.
 
 If you are helping a user install local stdio MCP, tell them to restart the agent session or open a new one after saving config if Webhound tools do not appear. Many clients load MCP servers only when a session starts.
 
@@ -80,6 +82,13 @@ Recommended first run:
 - product: report or dataset
 - budget: $5
 - free run: enabled when available
+
+Hound:
+- Hound is the research harness exposed by Webhound, not a selectable foundation model or mode.
+- It is built with DeepSeek V4 Pro and GPT-5.4 across planning, execution, verification, and assembly.
+- It is not a direct pass-through to one provider model and should not be described as "resolving" to a single backend.
+- The user's dollar budget, not a model picker, controls how much research effort runs.
+- Do not invent or present alternate Webhound model tiers or modes.
 
 Budget model:
 - $1 buys about 15 minutes of research.
@@ -252,7 +261,6 @@ function summarizeTraceExport(raw, maxChars = 60000, maxTraces = 1000) {
   };
 }
 
-const PUBLIC_MODEL_SCHEMA = z.enum(['hound', 'flash', 'pro', 'auto']);
 const CHATGPT_FILE_SCHEMA = z.object({
   download_url: z.string().url(),
   file_id: z.string(),
@@ -271,6 +279,7 @@ const SIDECAR_NOTE_STATUS_SCHEMA = z.enum(['pending', 'seen_by_planner', 'dismis
 
 const HELP_TOPICS = Object.freeze([
   'overview',
+  'hound',
   'when_to_use',
   'budget',
   'completion',
@@ -349,6 +358,18 @@ const HELP_GUIDANCE = Object.freeze({
     related_tools: ['webhound_start_report', 'webhound_start_dataset', 'webhound_add_sidecar_notes', 'webhound_list_sidecar_notes', 'webhound_update_sidecar_note', 'webhound_watch', 'webhound_export_session'],
     common_mistakes: ['Stopping a healthy run because it is taking time.', 'Reading working notes as final output.', 'Using steering for ordinary source suggestions.', 'Explaining model/provider internals during normal onboarding.'],
     suggested_user_facing_wording: 'Webhound will research in the background while I keep working. If I find a useful sourced note, I can pass it in without interrupting the run.',
+  },
+  hound: {
+    answer: "Hound is Webhound's research harness, not a selectable foundation model or mode. It is built with DeepSeek V4 Pro and GPT-5.4 across planning, execution, verification, and assembly. It is not a direct pass-through to one model and should not be described as resolving to a single provider backend. The user's dollar budget controls how much research effort runs.",
+    agent_behavior_rules: [
+      'Describe Hound as a research harness built with DeepSeek V4 Pro and GPT-5.4.',
+      'Explain that the dollar budget controls research effort and depth.',
+      'Do not describe Hound as a thin alias for, or a resolver to, one provider model.',
+      'Do not invent or present alternate Webhound model tiers or modes.',
+    ],
+    related_tools: ['webhound_start_report', 'webhound_start_dataset', 'webhound_get_defaults', 'webhound_set_defaults'],
+    common_mistakes: ['Inventing additional Webhound model tiers or modes.', 'Saying Hound resolves to DeepSeek V4 Pro.', 'Treating Hound like one immediate LLM response instead of a budgeted research harness.'],
+    suggested_user_facing_wording: "Hound is Webhound's research harness, built with DeepSeek V4 Pro and GPT-5.4. You choose the question and dollar budget; Hound spends that effort across search, reading, verification, and assembly.",
   },
   when_to_use: {
     answer: 'Use Webhound when the user needs more than a quick answer: market maps, vendor lists, competitor scans, diligence, current docs/API research, legal or policy research, person/company research, lead lists, job-search research, or sourced datasets.',
@@ -515,6 +536,7 @@ const HELP_GUIDANCE = Object.freeze({
 function resolveHelpTopic(topic, question = '') {
   if (HELP_TOPICS.includes(topic)) return topic;
   const q = String(question || '').toLowerCase();
+  if (/\b(hound|deepseek|research model|flash mode|pro mode|auto mode|gpt[-\s]?5(?:\.4)?)\b/.test(q)) return 'hound';
   if (/\b(budget|price|cost|spend|minutes|dollar|\$)\b/.test(q)) return 'budget';
   if (/\b(done|complete|finish|wait|running|output_ready|final|stop|stuck)\b/.test(q)) return 'completion';
   if (/\b(dataset|csv|rows|schema|extract|table)\b/.test(q)) return 'datasets';
@@ -1088,7 +1110,7 @@ export function createWebhoundMcpServer(options = {}) {
 
   registerTool(server, client, 'webhound_help', {
     title: 'Webhound Help',
-    description: 'No-spend topic-aware guide for explaining how Webhound works. Call this when the user asks about budgets, completion, setup, reports, datasets, sources, billing, troubleshooting, or general Webhound behavior.',
+    description: 'No-spend topic-aware guide for explaining Hound, budgets, completion, setup, reports, datasets, sources, billing, troubleshooting, or general Webhound behavior.',
     inputSchema: {
       topic: z.enum(HELP_TOPICS).optional(),
       question: z.string().max(1000).optional(),
@@ -1114,16 +1136,15 @@ export function createWebhoundMcpServer(options = {}) {
 
   registerTool(server, client, 'webhound_get_defaults', {
     title: 'Get Webhound MCP Defaults',
-    description: 'Read the saved MCP defaults for model, budget, product, and free-run use.',
+    description: 'Read the saved MCP defaults for budget, product, and free-run use. The MCP always uses Hound.',
     inputSchema: {},
     annotations: { readOnlyHint: true, openWorldHint: false },
   }, async () => jsonResult('Current Webhound MCP defaults.', await client.getDefaults()));
 
   registerTool(server, client, 'webhound_set_defaults', {
     title: 'Set Webhound MCP Defaults',
-    description: 'Set default model/budget/product/free-run behavior for future MCP runs. Recommended: hound, $5, use free run. Do not use this for private workspace-derived rules; save those locally in the agent workspace.',
+    description: 'Set default budget/product/free-run behavior for future MCP runs. The MCP always uses Hound. Recommended: $5 and use the free run when available. Do not use this for private workspace-derived rules; save those locally in the agent workspace.',
     inputSchema: {
-      default_model: PUBLIC_MODEL_SCHEMA.default('hound'),
       default_budget_usd: z.number().min(1).max(500).default(5),
       default_product: z.enum(['report', 'dataset']).default('report'),
       use_free_run_when_available: z.boolean().default(true),
@@ -1132,13 +1153,11 @@ export function createWebhoundMcpServer(options = {}) {
 
   registerTool(server, client, 'webhound_start_report', {
     title: 'Start Webhound Report',
-    description: 'Start a private long-running Webhound report. Budget controls research depth; watch until done=true. Do not force finalization before done=true.',
+    description: 'Start a private long-running report with Hound, Webhound\'s DeepSeek V4 Pro + GPT-5.4 research harness. Budget controls research depth; watch until done=true. Do not force finalization before done=true.',
     inputSchema: {
       prompt: z.string().min(8).max(12000),
       budget: z.number().min(1).max(500).optional(),
-      model: PUBLIC_MODEL_SCHEMA.optional(),
       title: z.string().optional(),
-      max_mode: z.boolean().optional(),
       output_instructions: z.string().optional(),
       context_session_ids: z.array(z.string()).optional(),
       file_ids: z.array(z.string()).optional(),
@@ -1171,14 +1190,12 @@ export function createWebhoundMcpServer(options = {}) {
 
   registerTool(server, client, 'webhound_start_dataset', {
     title: 'Start Webhound Dataset',
-    description: 'Start a private long-running Webhound dataset extraction. Budget controls extraction depth; watch until done=true. Do not force finalization before done=true.',
+    description: 'Start a private long-running dataset with Hound, Webhound\'s DeepSeek V4 Pro + GPT-5.4 research harness. Budget controls extraction depth; watch until done=true. Do not force finalization before done=true.',
     inputSchema: {
       prompt: z.string().min(8).max(12000),
       schema: z.any().optional(),
       budget: z.number().min(1).max(500).optional(),
-      model: PUBLIC_MODEL_SCHEMA.optional(),
       title: z.string().optional(),
-      max_mode: z.boolean().optional(),
       context_session_ids: z.array(z.string()).optional(),
       file_ids: z.array(z.string()).optional(),
       enable_checkpoints: z.boolean().optional(),

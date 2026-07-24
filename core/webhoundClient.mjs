@@ -33,6 +33,100 @@ function normalizeApiBase(value) {
   return String(value || DEFAULT_API_BASE).replace(/\/+$/, '');
 }
 
+function publicDefaults(value = {}) {
+  const { default_model: _legacyModel, ...defaults } = value || {};
+  return { ...defaults, research_harness: 'Hound' };
+}
+
+function publicFreeRun(value = {}) {
+  const { eligible_model: _legacyModel, ...freeRun } = value || {};
+  return { ...freeRun, research_harness: 'Hound' };
+}
+
+function publicStartResult(value = {}) {
+  const {
+    model: _legacyModel,
+    resolved_model: _resolvedModel,
+    max_mode: _legacyMaxMode,
+    ...result
+  } = value || {};
+  return { ...result, research_harness: 'Hound' };
+}
+
+function publicSessionRecord(value = {}) {
+  const {
+    model: _legacyModel,
+    resolved_model: _resolvedModel,
+    max_mode: _legacyMaxMode,
+    model_alias: _legacyAlias,
+    ...record
+  } = value || {};
+  return record;
+}
+
+function publicUsageEvent(value = {}) {
+  const event = publicSessionRecord(value);
+  if (event.details && typeof event.details === 'object' && !Array.isArray(event.details)) {
+    const {
+      model_name: _modelName,
+      billing_model_name: _billingModelName,
+      pricing_tier: _pricingTier,
+      provider: _provider,
+      ...details
+    } = event.details;
+    event.details = details;
+  }
+  return event;
+}
+
+function publicFullSession(value = {}) {
+  const result = {
+    ...publicSessionRecord(value),
+    research_harness: 'Hound',
+  };
+  if (result.session) result.session = publicSessionRecord(result.session);
+  if (result.metadata) result.metadata = publicSessionRecord(result.metadata);
+  if (result.usage) {
+    result.usage = {
+      ...result.usage,
+      events: Array.isArray(result.usage.events)
+        ? result.usage.events.map(publicUsageEvent)
+        : result.usage.events,
+    };
+  }
+  if (Array.isArray(result.research_agents)) {
+    result.research_agents = result.research_agents.map(publicSessionRecord);
+  }
+  return result;
+}
+
+function publicSessionCollection(value = {}) {
+  if (Array.isArray(value)) return value.map(item => ({ ...publicSessionRecord(item), research_harness: 'Hound' }));
+  const result = publicSessionRecord(value);
+  for (const key of ['sessions', 'results', 'items', 'data']) {
+    if (Array.isArray(result[key])) {
+      result[key] = result[key].map(item => ({ ...publicSessionRecord(item), research_harness: 'Hound' }));
+    }
+  }
+  return result;
+}
+
+function publicOnboarding(value = {}) {
+  const onboarding = { ...(value || {}) };
+  if (onboarding.account_state) {
+    onboarding.account_state = {
+      ...onboarding.account_state,
+      defaults: publicDefaults(onboarding.account_state.defaults),
+      free_run: publicFreeRun(onboarding.account_state.free_run),
+    };
+  }
+  if (onboarding.recommended_defaults) {
+    onboarding.recommended_defaults = publicDefaults(onboarding.recommended_defaults);
+  }
+  if (onboarding.free_run) onboarding.free_run = publicFreeRun(onboarding.free_run);
+  return onboarding;
+}
+
 function mimeFromFilename(fileName) {
   const ext = path.extname(fileName || '').toLowerCase();
   if (ext === '.csv') return 'text/csv';
@@ -132,7 +226,13 @@ export class WebhoundApiClient {
         this.get('/mcp/defaults').catch(error => ({ error: error.message })),
         this.get('/mcp/free-run').catch(error => ({ error: error.message })),
       ]);
-      return { authenticated: true, health, credits, defaults: defaults?.defaults || defaults, free_run: freeRun?.free_run || freeRun };
+      return {
+        authenticated: true,
+        health,
+        credits,
+        defaults: publicDefaults(defaults?.defaults || defaults),
+        free_run: publicFreeRun(freeRun?.free_run || freeRun),
+      };
     } catch (error) {
       return { authenticated: false, error: error.message, code: error.code || null, status: error.status || null };
     }
@@ -140,17 +240,20 @@ export class WebhoundApiClient {
 
   async getDefaults() {
     const data = await this.get('/mcp/defaults');
-    return data.defaults || data;
+    return publicDefaults(data.defaults || data);
   }
 
   async setDefaults(input) {
-    const data = await this.patch('/mcp/defaults', input);
-    return data.defaults || data;
+    const data = await this.patch('/mcp/defaults', {
+      ...input,
+      default_model: 'hound',
+    });
+    return publicDefaults(data.defaults || data);
   }
 
   async onboarding() {
     const data = await this.get('/mcp/onboarding');
-    return data.onboarding || data;
+    return publicOnboarding(data.onboarding || data);
   }
 
   async account() {
@@ -163,45 +266,45 @@ export class WebhoundApiClient {
     return {
       credits,
       usage,
-      free_run: freeRun?.free_run || null,
-      defaults: defaults?.defaults || null,
+      free_run: freeRun ? publicFreeRun(freeRun.free_run || freeRun) : null,
+      defaults: defaults ? publicDefaults(defaults.defaults || defaults) : null,
     };
   }
 
   async startReport(args) {
     const defaults = await this.getDefaults().catch(() => ({}));
     const budget = Number(args.budget ?? defaults.default_budget_usd ?? 5);
-    const model = args.model || defaults.default_model || 'hound';
-    return this.post('/research', {
+    const result = await this.post('/research', {
       title: args.title || titleFromPrompt(args.prompt),
       query: args.prompt,
       budget,
-      model,
-      max_mode: !!args.max_mode,
+      model: 'hound',
+      max_mode: false,
       output_instructions: args.output_instructions || undefined,
       context_session_ids: args.context_session_ids || undefined,
       file_ids: args.file_ids || undefined,
       enable_checkpoints: args.enable_checkpoints,
       use_free_run_when_available: args.use_free_run_when_available ?? defaults.use_free_run_when_available ?? true,
     });
+    return publicStartResult(result);
   }
 
   async startDataset(args) {
     const defaults = await this.getDefaults().catch(() => ({}));
     const budget = Number(args.budget ?? defaults.default_budget_usd ?? 5);
-    const model = args.model || defaults.default_model || 'hound';
-    return this.post('/extractions', {
+    const result = await this.post('/extractions', {
       title: args.title || titleFromPrompt(args.prompt),
       query: args.prompt,
       budget,
-      model,
-      max_mode: !!args.max_mode,
+      model: 'hound',
+      max_mode: false,
       schema: args.schema || undefined,
       context_session_ids: args.context_session_ids || undefined,
       file_ids: args.file_ids || undefined,
       enable_checkpoints: args.enable_checkpoints,
       use_free_run_when_available: args.use_free_run_when_available ?? defaults.use_free_run_when_available ?? true,
     });
+    return publicStartResult(result);
   }
 
   async watch(sessionId) {
@@ -210,8 +313,8 @@ export class WebhoundApiClient {
       this.get(`/sessions/${encodeURIComponent(sessionId)}/diagnostics`).catch(error => ({ error: error.message })),
     ]);
     return {
-      ...(diagnostics || {}),
-      status_snapshot: status,
+      ...publicSessionRecord(diagnostics || {}),
+      status_snapshot: publicSessionRecord(status || {}),
       budget_control: status?.budget_control || diagnostics?.budget_control || null,
       url: this.webUrl(sessionId),
     };
@@ -337,7 +440,7 @@ export class WebhoundApiClient {
     });
     if (args.type && args.type !== 'all') params.set('session_type', args.type);
     if (args.status) params.set('status', args.status);
-    return this.get(`/sessions?${params}`);
+    return publicSessionCollection(await this.get(`/sessions?${params}`));
   }
 
   async searchSessions(args = {}) {
@@ -345,11 +448,11 @@ export class WebhoundApiClient {
       query: args.query,
       limit: String(args.limit || 10),
     });
-    return this.get(`/sessions/search?${params}`);
+    return publicSessionCollection(await this.get(`/sessions/search?${params}`));
   }
 
   async getSession(sessionId) {
-    return this.get(`/sessions/${encodeURIComponent(sessionId)}/full`);
+    return publicFullSession(await this.get(`/sessions/${encodeURIComponent(sessionId)}/full`));
   }
 
   async uploadFile(args = {}) {

@@ -1,8 +1,8 @@
 {
   "name": "webhound-mcp",
-  "version": "0.4.2",
+  "version": "0.4.3",
   "mcpName": "ai.webhound/webhound",
-  "description": "MCP server that lets agents run Webhound reports and datasets as a research sidecar, save shared sidecar notes, diagnose failures, and read cited outputs.",
+  "description": "Run budgeted reports and datasets with Hound, Webhound's DeepSeek V4 Pro + GPT-5.4 research harness, and return inspectable cited evidence.",
   "bin": {
     "webhound-mcp": "bin/server.mjs"
   },
@@ -47,6 +47,9 @@
   "repository": {
     "type": "git",
     "url": "https://github.com/WebhoundAI/webhound-mcp"
+  },
+  "bugs": {
+    "url": "https://github.com/WebhoundAI/webhound-mcp/issues"
   },
   "homepage": "https://www.webhound.ai/mcp-setup"
 }

@@ -62,6 +62,15 @@ https://api.webhound.ai/api/v2/mcp
 
 Paste the URL into Claude's custom connector flow. The hosted server exposes OAuth discovery, authorize, and token endpoints for that connect flow.
 
+Smithery:
+
+1. Add the public `webhound/webhound` server to your own Smithery toolbox.
+2. Every new Smithery connection starts in `auth_required` and opens a Webhound setup screen that asks that user for their own Webhound API key.
+3. Webhound exchanges that key for a scoped MCP token stored on that Smithery connection.
+4. Connecting another client to the same already-authorized toolbox may not prompt again; that is reuse of the same user's saved connection, not a publisher credential shared with other users.
+
+Do not distribute one user's private toolbox endpoint as if it were a shared Webhound credential. Other users should add Webhound to their own toolbox or connect to the hosted Webhound MCP URL directly.
+
 Manus or generic hosted MCP:
 
 ```text
@@ -119,6 +128,17 @@ VS Code:
 
 Use the same stdio server shape for Windsurf and Cline. Windsurf commonly
 stores it in `~/.codeium/windsurf/mcp_config.json`.
+
+## Hound
+
+Hound is the research harness exposed by Webhound, not a selectable foundation
+model or mode. It is built with DeepSeek V4 Pro and GPT-5.4 across planning,
+execution, verification, and assembly. It is not a direct pass-through to one
+model and should not be described as "resolving" to a single provider backend.
+
+The prompt defines what to investigate. The user's dollar budget defines how
+much research effort Hound can spend searching, reading, writing, and verifying
+before assembly. The MCP does not expose alternate model tiers or modes.
 
 ## Defaults
 

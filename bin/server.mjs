@@ -19,7 +19,6 @@ Environment:
   WEBHOUND_KEY                 Webhound API key (required for real tool calls)
   WEBHOUND_API_BASE            API base (default https://api.webhound.ai/api/v2)
   WEBHOUND_APP_BASE            App base (default https://webhound.ai)
-  WEBHOUND_DEFAULT_MODEL       Optional local setup hint; server defaults still win (default hound)
   WEBHOUND_DEFAULT_BUDGET      Optional local setup hint; server defaults still win
 
 Public tools:
