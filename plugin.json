@@ -1,7 +1,7 @@
 {
   "name": "webhound",
   "description": "Run budget-controlled, inspectable Webhound investigations. Hound is the research harness built with DeepSeek V4 Pro and GPT-5.4 across planning, execution, verification, and assembly—not a selectable model or mode.",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "author": {
     "name": "Webhound",
     "email": "moe@webhound.ai",

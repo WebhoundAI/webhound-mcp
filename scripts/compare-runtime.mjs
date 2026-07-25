@@ -11,10 +11,24 @@ if (!otherRoot) {
 }
 
 const files = [
+  'LICENSE',
+  'README.md',
   'bin/server.mjs',
+  'canonical-runtime.json',
   'core/http.mjs',
   'core/server.mjs',
   'core/webhoundClient.mjs',
+  'dist/webhound-mcp.mjs',
+  'npm-shrinkwrap.json',
+  'package.json',
+  'scripts/build-package.mjs',
+  'scripts/check-runtime-manifest.mjs',
+  'scripts/compare-runtime.mjs',
+  'scripts/verify-consumer.mjs',
+  'scripts/verify-package.mjs',
+  'server.json',
+  'tests/contract.test.mjs',
+  'tests/server-contract.test.mjs',
 ];
 const hash = async file => createHash('sha256').update(await readFile(file)).digest('hex');
 for (const file of files) {
@@ -31,4 +45,4 @@ const [currentPackage, otherPackage] = await Promise.all([
 if (currentPackage.version !== otherPackage.version) {
   throw new Error(`Runtime parity failed: package versions differ (${currentPackage.version} vs ${otherPackage.version})`);
 }
-console.log(`Runtime parity verified: ${files.length} files and package version ${currentPackage.version}.`);
+console.log(`Canonical release parity verified: ${files.length} files and package version ${currentPackage.version}.`);

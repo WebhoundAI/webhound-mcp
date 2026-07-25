@@ -1,11 +1,11 @@
 {
   "schema_version": 1,
   "canonical_source": "WebhoundAI/webhound-server:mcp",
-  "package_version": "0.5.0",
+  "package_version": "0.5.1",
   "files": {
-    "bin/server.mjs": "acc717cc2cb3b0f9a2927cea3e84ba09a4597d23c606f1203a2b2088161b542d",
+    "bin/server.mjs": "39b356d5f927fb4a47910354d1c19856c87273ec19a2d42c9da43a7080112da9",
     "core/http.mjs": "c66d63c6ad630962b1f782ce5cdd853b39d5aa4e681e138c88ebe22af45a0c3d",
-    "core/server.mjs": "6c5bd65dd4f21b846d4b6e57636e84f33573cef0f19fef1e968b74d1108f16e3",
-    "core/webhoundClient.mjs": "2c0c2bf4ebd7846bdf37f641b1a1e19c3699d62ec37fd4ae7553f84d98061145"
+    "core/server.mjs": "ad025ef4c522642d0cc3b677683fcef05923b6e95d8d284954b4c5e725478546",
+    "core/webhoundClient.mjs": "88ee5e7c6753148f6dba3020007ba6f154b2297d00df9634b6bbc227d0ad00e4"
   }
 }

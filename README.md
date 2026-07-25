@@ -94,7 +94,7 @@ Create a Webhound API key, then add the stdio server to your agent:
   "mcpServers": {
     "webhound": {
       "command": "npx",
-      "args": ["-y", "webhound-mcp@0.5.0"],
+      "args": ["-y", "webhound-mcp@0.5.1"],
       "env": {
         "WEBHOUND_KEY": "wh_..."
       }
@@ -134,8 +134,9 @@ Save, sign in to Webhound, approve the connection, then start a new Manus task
 and send:
 
 ```text
-Call webhound_onboarding with client set to hosted. Follow its next message one
-step at a time. Do not create or edit workspace rules unless I explicitly ask.
+Call webhound_onboarding with client set to hosted. Send its message exactly
+once, present its choices, and follow its next_action one step at a time. Do
+not create or edit workspace rules unless I explicitly ask.
 ```
 
 Other hosted clients should use the same server URL with OAuth when supported.
@@ -148,7 +149,7 @@ Claude Code:
 claude mcp add --transport http webhound https://api.webhound.ai/api/v2/mcp
 
 # Local stdio alternative:
-claude mcp add --transport stdio webhound --env WEBHOUND_KEY=wh_... -- npx -y webhound-mcp@0.5.0
+claude mcp add --transport stdio webhound --env WEBHOUND_KEY=wh_... -- npx -y webhound-mcp@0.5.1
 ```
 
 Codex:
@@ -156,7 +157,7 @@ Codex:
 ```toml
 [mcp_servers.webhound]
 command = "npx"
-args = ["-y", "webhound-mcp@0.5.0"]
+args = ["-y", "webhound-mcp@0.5.1"]
 
 [mcp_servers.webhound.env]
 WEBHOUND_KEY = "wh_..."
@@ -187,7 +188,7 @@ VS Code:
     "webhound": {
       "type": "stdio",
       "command": "npx",
-      "args": ["-y", "webhound-mcp@0.5.0"],
+      "args": ["-y", "webhound-mcp@0.5.1"],
       "env": {
         "WEBHOUND_KEY": "wh_..."
       }
@@ -374,9 +375,10 @@ echoes `normalized_schema` before the dataset begins.
 - `webhound_account`
 - `webhound_diagnose`
 
-Supported upload formats are CSV, XLSX, XLS, PDF, DOCX, DOC, TXT, Markdown,
-and VTT. MIME type, filename extension, and recognizable file bytes are checked
-before the upload reaches Webhound.
+Supported upload formats are CSV, XLSX, PDF, DOCX, TXT, Markdown, and VTT.
+Convert legacy XLS/DOC files to XLSX/DOCX before uploading. MIME type, filename
+extension, and recognizable file bytes are checked before the upload reaches
+Webhound.
 
 ## Completion And Diagnostics
 

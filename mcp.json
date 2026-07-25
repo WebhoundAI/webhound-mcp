@@ -3,7 +3,6 @@
     "webhound": {
       "url": "https://api.webhound.ai/api/v2/mcp",
       "oauthScopes": [
-        "webhound:api",
         "webhound:mcp"
       ]
     }

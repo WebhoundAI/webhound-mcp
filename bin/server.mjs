@@ -10,7 +10,7 @@ function printHelp() {
 Run Webhound's MCP server over stdio.
 
 Usage:
-  WEBHOUND_KEY=wh_... npx -y webhound-mcp
+  WEBHOUND_KEY=wh_... npx -y webhound-mcp@${VERSION}
   webhound-mcp --help
   webhound-mcp --version
   webhound-mcp --self-test

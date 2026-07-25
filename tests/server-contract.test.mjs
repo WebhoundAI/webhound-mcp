@@ -4,7 +4,11 @@ import test from 'node:test';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 
-import { createWebhoundMcpServer, TOOL_NAMES } from '../core/server.mjs';
+import {
+  createWebhoundMcpServer,
+  toolSuccessContractIssue,
+  TOOL_NAMES,
+} from '../core/server.mjs';
 import { webhoundError } from '../core/webhoundClient.mjs';
 
 async function connectedClient(fakeClient) {
@@ -45,6 +49,17 @@ test('all 30 tools publish dedicated closed output contracts', async (t) => {
   }
 });
 
+test('all 30 tools require domain evidence before a response can count as success', () => {
+  assert.equal(TOOL_NAMES.length, 30);
+  for (const name of TOOL_NAMES) {
+    assert.match(
+      toolSuccessContractIssue(name, {}),
+      /\S/,
+      `${name} accepted an empty success payload`
+    );
+  }
+});
+
 test('all 30 tool handlers execute a schema-valid mocked happy path', async (t) => {
   const completed = {
     session_id: 'session-1',
@@ -58,6 +73,7 @@ test('all 30 tool handlers execute a schema-valid mocked happy path', async (t) 
     cost: 4.9,
     checked_at: '2026-07-25T00:00:00.000Z',
     budget_control: null,
+    documents: { output_word_count: 3 },
     alerts: [],
   };
   const fullSession = {
@@ -122,7 +138,14 @@ test('all 30 tool handlers execute a schema-valid mocked happy path', async (t) 
     async resume() { return { session_id: 'session-1', status: 'running', additional_budget: 1 }; },
     async addBudget() { return { session_id: 'session-1', status: 'running', amount: 1, budget: 6 }; },
     async setBudget() { return { session_id: 'session-1', status: 'running', target_budget: 4.91, completion_contract: 'budget_complete' }; },
-    async getOutput() { return { session_id: 'session-1', content_markdown: '# Complete report' }; },
+    async getOutput() {
+      return {
+        session_id: 'session-1',
+        content_markdown: '# Complete report',
+        doc_type: 'output',
+        is_output: true,
+      };
+    },
     async exportSession() {
       return {
         session_id: 'session-1',
@@ -201,6 +224,545 @@ test('all 30 tool handlers execute a schema-valid mocked happy path', async (t) 
   }
 });
 
+test('billing-required errors remain typed for start and non-start spend tools', async (t) => {
+  const cases = [
+    {
+      name: 'webhound_start_report',
+      arguments: { prompt: 'Research this launch question carefully' },
+      method: 'startReport',
+      body: {
+        message: 'Add billing before starting.',
+        required: 5,
+        current_balance: 0,
+        top_up_url: 'https://www.webhound.ai/billing',
+      },
+      expectsSessionStarted: false,
+      expectsAmounts: true,
+    },
+    {
+      name: 'webhound_start_dataset',
+      arguments: {
+        prompt: 'Extract a sourced company dataset',
+        schema: { entity_name: 'Company', attributes: [{ name: 'name', type: 'string', is_primary: true }] },
+      },
+      method: 'startDataset',
+      body: { message: 'Add billing before starting.' },
+      expectsSessionStarted: false,
+      expectsAmounts: false,
+    },
+    {
+      name: 'webhound_add_budget',
+      arguments: { session_id: 'session-1', amount: 1 },
+      method: 'addBudget',
+      body: {
+        message: 'Add billing before increasing the budget.',
+        required_credits: 1,
+        current_credits: 0,
+      },
+      expectsSessionStarted: undefined,
+      expectsAmounts: true,
+    },
+    {
+      name: 'webhound_resume',
+      arguments: { session_id: 'session-1', additional_budget: 1 },
+      method: 'resume',
+      body: { message: 'Add billing before resuming.' },
+      expectsSessionStarted: undefined,
+      expectsAmounts: false,
+    },
+  ];
+
+  for (const scenario of cases) {
+    const connection = await connectedClient(baseFake({
+      async [scenario.method]() {
+        throw webhoundError('payment required', {
+          status: 402,
+          body: scenario.body,
+        });
+      },
+    }));
+    t.after(() => connection.close());
+
+    const result = await connection.client.callTool({
+      name: scenario.name,
+      arguments: scenario.arguments,
+    });
+    assert.equal(result.isError, true, scenario.name);
+    assert.equal(result.structuredContent.code, 'billing_required', scenario.name);
+    assert.equal(result.structuredContent.status, 402, scenario.name);
+    assert.equal(result.structuredContent.retryable, false, scenario.name);
+    assert.equal(result.structuredContent.session_started, scenario.expectsSessionStarted, scenario.name);
+    assert.equal(result.structuredContent.billing_url, 'https://www.webhound.ai/billing', scenario.name);
+    assert.match(result.structuredContent.next_action, /billing/i, scenario.name);
+    if (scenario.expectsAmounts) {
+      assert.equal(result.structuredContent.required, scenario.body.required ?? scenario.body.required_credits, scenario.name);
+      assert.equal(result.structuredContent.current_balance, scenario.body.current_balance ?? scenario.body.current_credits, scenario.name);
+    } else {
+      assert.equal(result.structuredContent.required, undefined, scenario.name);
+      assert.equal(result.structuredContent.current_balance, undefined, scenario.name);
+    }
+  }
+});
+
+test('degraded health and account probes preserve useful partial responses', async (t) => {
+  const connection = await connectedClient(baseFake({
+    async health() {
+      return {
+        mcp_ready: true,
+        api_reachable: true,
+        authenticated: true,
+        services: { health: { ok: true }, defaults: { ok: false }, free_run: { ok: false } },
+        errors: [
+          { service: 'defaults', message: 'temporarily unavailable' },
+          { service: 'free_run', message: 'temporarily unavailable' },
+        ],
+        health: { status: 'ok' },
+        defaults: null,
+        free_run: null,
+      };
+    },
+    async account() {
+      return {
+        authenticated: true,
+        credits: { credits: 10 },
+        usage: { operation_count: 1 },
+        defaults: null,
+        free_run: null,
+        billing: { auto_recharge_enabled: false },
+      };
+    },
+  }));
+  t.after(() => connection.close());
+
+  const health = await connection.client.callTool({
+    name: 'webhound_health',
+    arguments: {},
+  });
+  assert.equal(health.isError, false);
+  assert.equal(health.structuredContent.mcp_ready, true);
+  assert.equal(health.structuredContent.defaults, null);
+  assert.equal(health.structuredContent.free_run, null);
+  assert.equal(health.structuredContent.errors.length, 2);
+
+  const account = await connection.client.callTool({
+    name: 'webhound_account',
+    arguments: {},
+  });
+  assert.equal(account.isError, false);
+  assert.equal(account.structuredContent.authenticated, true);
+  assert.equal(account.structuredContent.defaults, null);
+  assert.equal(account.structuredContent.free_run, null);
+  assert.equal(account.structuredContent.credits.credits, 10);
+});
+
+test('MCP dataset input accepts every backend-supported native field and alias', async (t) => {
+  let sentSchema;
+  const connection = await connectedClient(baseFake({
+    async startDataset(args) {
+      sentSchema = args.schema;
+      return {
+        session_id: 'dataset-1',
+        product: 'dataset',
+        normalized_schema: args.schema,
+        schema_source: 'webhound_native',
+      };
+    },
+  }));
+  t.after(() => connection.close());
+
+  const result = await connection.client.callTool({
+    name: 'webhound_start_dataset',
+    arguments: {
+      prompt: 'Extract a sourced company dataset',
+      schema: {
+        entity: {
+          name: 'Company',
+          description: 'A company record',
+          criteria: ['Has an official website'],
+        },
+        attributes: [
+          {
+            name: 'company_id',
+            type: 'text',
+            required: true,
+            is_primary: true,
+            format: 'uuid',
+          },
+          {
+            name: 'tags',
+            type: 'array',
+            items: { type: 'string' },
+            item_type: 'string',
+          },
+        ],
+      },
+    },
+  });
+  assert.equal(result.isError, false, result.content?.[0]?.text);
+  assert.equal(sentSchema.attributes[0].type, 'text');
+  assert.equal(sentSchema.attributes[0].required, true);
+  assert.equal(sentSchema.attributes[1].type, 'array');
+  assert.equal(sentSchema.attributes[1].items.type, 'string');
+});
+
+test('production-shaped fields remain available and unknown backend fields are normalized', async (t) => {
+  const completed = sessionId => ({
+    session_id: sessionId,
+    product: sessionId.startsWith('dataset') ? 'dataset' : 'report',
+    session_type: sessionId.startsWith('dataset') ? 'extraction' : 'research',
+    status: 'completed',
+    done: true,
+    output_ready: true,
+    completion_reason: 'natural_complete',
+    budget: 1,
+    cost: 0.99,
+    checked_at: '2026-07-25T01:00:00.000Z',
+    ...(sessionId.startsWith('dataset')
+      ? { dataset: { rows: 1 } }
+      : { documents: { output_word_count: 3 } }),
+    alerts: [],
+  });
+  const fake = baseFake({
+    async getDefaults() {
+      return {
+        default_budget_usd: 5,
+        default_product: 'report',
+        use_free_run_when_available: true,
+        research_harness: 'Hound',
+        agent_rules: { completion_rule: 'Wait for done=true.' },
+        updated_at: '2026-07-25T01:00:00.000Z',
+        source: 'mcp_user_settings',
+        backend_internal: 'drop-me',
+      };
+    },
+    async setBudget() {
+      return {
+        session_id: 'report-1',
+        status: 'running',
+        target_budget: 4.91,
+        requested_target_budget: 4.5,
+        minimum_target_budget: 4.91,
+        adjusted_to_cover_current_spend: true,
+        resumed_for_assembly: true,
+        completion_contract: 'budget_complete',
+        backend_internal: 'drop-me',
+      };
+    },
+    async setDefaults(args) {
+      return {
+        ...args,
+        research_harness: 'Hound',
+        agent_rules: { completion_rule: 'Wait for done=true.' },
+        updated_at: '2026-07-25T01:00:00.000Z',
+        source: 'mcp_user_settings',
+        backend_internal: 'drop-me',
+      };
+    },
+    async listSessions() {
+      return {
+        sessions: [completed('report-1')],
+        page: 1,
+        page_size: 15,
+        total_pages: 2,
+        total_count: 16,
+        limit: 15,
+        total: 16,
+        has_more: true,
+        backend_internal: 'drop-me',
+      };
+    },
+    async searchSessions() {
+      return {
+        results: [completed('report-1')],
+        count: 1,
+        total: 1,
+        active_exact_matches_added: 1,
+        backend_internal: 'drop-me',
+      };
+    },
+    async watch(sessionId) {
+      return completed(sessionId);
+    },
+    async getOutput(sessionId) {
+      if (sessionId.startsWith('dataset')) {
+        return {
+          session_id: sessionId,
+          rows: [{ name: 'Example' }],
+          total_rows: 1,
+          page: 1,
+          page_size: 100,
+          schema: { entity_name: 'Company', attributes: [] },
+          backend_internal: 'drop-me',
+        };
+      }
+      return {
+        session_id: sessionId,
+        content_markdown: '# Complete report',
+        doc_name: 'Final Report',
+        doc_type: 'output',
+        is_output: true,
+        total_lines: 1,
+        showing: { start: 1, end: 1, count: 1 },
+        sources: [{ url: 'https://example.com', title: 'Example' }],
+        available_documents: [{
+          created_at: '2026-07-25T01:00:00.000Z',
+          doc_name: 'Final Report',
+          doc_type: 'output',
+          is_output: true,
+          line_count: 1,
+        }],
+        backend_internal: 'drop-me',
+      };
+    },
+    async exportSession(sessionId) {
+      return {
+        session_id: sessionId,
+        filename: sessionId.startsWith('dataset') ? 'dataset.pdf' : 'report.pdf',
+        format: 'pdf',
+        mime_type: 'application/pdf',
+        encoding: 'base64',
+        size_bytes: 128,
+        content: 'JVBERi0xLjQ=',
+        download_url: `https://api.webhound.ai/api/v2/sessions/${sessionId}/export?format=pdf&download=true`,
+        ...(sessionId.startsWith('dataset') ? { row_count: 1 } : { document_count: 1 }),
+        supported_formats: ['pdf'],
+        backend_internal: 'drop-me',
+      };
+    },
+    async getClaims(sessionId) {
+      return {
+        session_id: sessionId,
+        claims: [{ claim_id: `${sessionId}:claim:1` }],
+        count: 1,
+        claim_count: 1,
+        total: 1,
+        ...(sessionId.startsWith('dataset') ? { claim_type: 'dataset_cell' } : {}),
+        backend_internal: 'drop-me',
+      };
+    },
+    async getSources(sessionId) {
+      return {
+        session_id: sessionId,
+        sources: [{ url: 'https://example.com' }],
+        count: 1,
+        source_count: 1,
+        total: 1,
+        backend_internal: 'drop-me',
+      };
+    },
+    async getSession(sessionId) {
+      return {
+        ...completed(sessionId),
+        generated_at: '2026-07-25T01:00:00.000Z',
+        documents: sessionId.startsWith('dataset') ? [] : [{
+          document_id: `${sessionId}:output`,
+          document_role: 'current_output',
+          is_output: true,
+          content_markdown: '# Complete report',
+        }],
+        dataset: sessionId.startsWith('dataset') ? { row_count: 1, rows: [{ name: 'Example' }] } : {},
+        evidence: { claim_count: 1, source_count: 1 },
+        backend_internal: 'drop-me',
+      };
+    },
+    async getShareableLink(sessionId) {
+      return {
+        session_id: sessionId,
+        session_type: 'research',
+        share_url: `https://webhound.ai/document/${sessionId}`,
+        artifact_type: 'report',
+        is_public: true,
+        title: 'Shared report',
+        route: `/document/${sessionId}`,
+        message: 'Public link created.',
+        backend_internal: 'drop-me',
+      };
+    },
+    async uploadFile() {
+      return {
+        file_id: 'file-1',
+        filename: 'notes.txt',
+        file_name: 'notes.txt',
+        mime_type: 'text/plain',
+        size: 5,
+        size_bytes: 5,
+        extraction_status: 'ready',
+        backend_internal: 'drop-me',
+      };
+    },
+  });
+  const connection = await connectedClient(fake);
+  t.after(() => connection.close());
+
+  const calls = [
+    ['webhound_get_defaults', {}],
+    ['webhound_set_defaults', { default_budget_usd: 5, default_product: 'report', use_free_run_when_available: true }],
+    ['webhound_list_sessions', {}],
+    ['webhound_search_sessions', { query: 'report' }],
+    ['webhound_set_budget', { session_id: 'report-1', target_budget: 4.5, user_requested_budget_reduction: true }],
+    ['webhound_get_output', { session_id: 'report-1', kind: 'report' }],
+    ['webhound_get_output', { session_id: 'dataset-1', kind: 'dataset' }],
+    ['webhound_export_session', { session_id: 'report-1', format: 'pdf' }],
+    ['webhound_export_session', { session_id: 'dataset-1', format: 'pdf' }],
+    ['webhound_get_claims', { session_id: 'report-1' }],
+    ['webhound_get_claims', { session_id: 'dataset-1' }],
+    ['webhound_get_sources', { session_id: 'dataset-1' }],
+    ['webhound_get_session', { session_id: 'report-1' }],
+    ['webhound_get_evidence_pack', { session_id: 'report-1', kind: 'report' }],
+    ['webhound_get_shareable_link', { session_id: 'report-1' }],
+    ['webhound_upload_file', { text: 'notes', file_name: 'notes.txt', mime_type: 'text/plain' }],
+  ];
+  const outputs = new Map();
+  for (const [name, args] of calls) {
+    const result = await connection.client.callTool({ name, arguments: args });
+    assert.equal(result.isError, false, `${name}: ${result.content?.[0]?.text || 'unexpected error'}`);
+    assert.equal(result.structuredContent.backend_internal, undefined, `${name}: leaked an undeclared backend field`);
+    outputs.set(`${name}:${args.session_id || 'none'}`, result.structuredContent);
+  }
+
+  assert.equal(outputs.get('webhound_get_defaults:none').source, 'mcp_user_settings');
+  assert.equal(outputs.get('webhound_list_sessions:none').page_size, 15);
+  assert.equal(outputs.get('webhound_list_sessions:none').total_count, 16);
+  assert.equal(outputs.get('webhound_search_sessions:none').active_exact_matches_added, 1);
+  assert.equal(outputs.get('webhound_set_budget:report-1').resumed_for_assembly, true);
+  assert.equal(outputs.get('webhound_get_output:report-1').doc_name, 'Final Report');
+  assert.equal(outputs.get('webhound_get_output:dataset-1').page_size, 100);
+  assert.equal(outputs.get('webhound_export_session:report-1').document_count, 1);
+  assert.equal(outputs.get('webhound_export_session:dataset-1').row_count, 1);
+  assert.equal(outputs.get('webhound_get_claims:dataset-1').claim_type, 'dataset_cell');
+  assert.equal(outputs.get('webhound_get_sources:dataset-1').count, 1);
+  assert.equal(outputs.get('webhound_get_session:report-1').generated_at, '2026-07-25T01:00:00.000Z');
+  assert.equal(outputs.get('webhound_get_evidence_pack:report-1').generated_at, '2026-07-25T01:00:00.000Z');
+  assert.equal(outputs.get('webhound_get_shareable_link:report-1').route, '/document/report-1');
+  assert.equal(outputs.get('webhound_upload_file:none').extraction_status, 'ready');
+});
+
+test('output contract errors preserve non-retryable mutation safety', async (t) => {
+  const connection = await connectedClient(baseFake({
+    async getDefaults() {
+      return { default_budget_usd: 'five' };
+    },
+  }));
+  t.after(() => connection.close());
+  const result = await connection.client.callTool({
+    name: 'webhound_get_defaults',
+    arguments: {},
+  });
+  assert.equal(result.isError, true);
+  assert.equal(result.structuredContent.code, 'MCP_OUTPUT_CONTRACT_ERROR');
+  assert.equal(result.structuredContent.retryable, false);
+  assert.match(result.structuredContent.next_action, /Do not repeat a mutating tool blindly/i);
+});
+
+test('malformed 2xx mutation responses become non-retryable UNKNOWN_OUTCOME errors', async () => {
+  const cases = [
+    ['webhound_set_defaults', 'setDefaults', { default_budget_usd: 5, default_product: 'report', use_free_run_when_available: true }],
+    ['webhound_start_report', 'startReport', { prompt: 'Research this launch question carefully' }],
+    ['webhound_start_dataset', 'startDataset', { prompt: 'Extract a sourced company dataset' }],
+    ['webhound_add_sidecar_notes', 'addSidecarNotes', { session_id: 'session-1', notes: [{ summary: 'Finding' }] }],
+    ['webhound_update_sidecar_note', 'updateSidecarNote', { session_id: 'session-1', note_id: 'note-1', status: 'dismissed' }],
+    ['webhound_send_message', 'sendMessage', { session_id: 'session-1', message: 'Use the clarified scope', reason: 'user_guidance' }],
+    ['webhound_stop', 'stop', { session_id: 'session-1', user_requested_stop: true }],
+    ['webhound_resume', 'resume', { session_id: 'session-1', additional_budget: 1 }],
+    ['webhound_add_budget', 'addBudget', { session_id: 'session-1', amount: 1 }],
+    ['webhound_set_budget', 'setBudget', { session_id: 'session-1', target_budget: 4.91, user_requested_budget_reduction: true }],
+    ['webhound_get_shareable_link', 'getShareableLink', { session_id: 'session-1' }],
+    ['webhound_upload_file', 'uploadFile', { text: 'notes', file_name: 'notes.txt', mime_type: 'text/plain' }],
+  ];
+
+  for (const [name, method, arguments_] of cases) {
+    const connection = await connectedClient(baseFake({
+      async [method]() { return {}; },
+    }));
+    const result = await connection.client.callTool({ name, arguments: arguments_ });
+    await connection.close();
+    assert.equal(result.isError, true, name);
+    assert.equal(result.structuredContent.code, 'UNKNOWN_OUTCOME', name);
+    assert.equal(result.structuredContent.status, null, name);
+    assert.equal(result.structuredContent.retryable, false, name);
+    assert.match(result.structuredContent.next_action, /\S/, name);
+  }
+});
+
+test('malformed 2xx read responses become non-retryable 502 contract errors', async () => {
+  const cases = [
+    ['webhound_get_defaults', 'getDefaults', {}],
+    ['webhound_watch', 'watch', { session_id: 'session-1' }],
+    ['webhound_get_claims', 'getClaims', { session_id: 'session-1' }],
+    ['webhound_get_sources', 'getSources', { session_id: 'session-1' }],
+    ['webhound_search_sessions', 'searchSessions', { query: 'launch' }],
+    ['webhound_list_sessions', 'listSessions', {}],
+    ['webhound_get_session', 'getSession', { session_id: 'session-1' }],
+    ['webhound_account', 'account', {}],
+  ];
+
+  for (const [name, method, arguments_] of cases) {
+    const connection = await connectedClient(baseFake({
+      async [method]() { return {}; },
+    }));
+    const result = await connection.client.callTool({ name, arguments: arguments_ });
+    await connection.close();
+    assert.equal(result.isError, true, name);
+    assert.equal(result.structuredContent.code, 'UPSTREAM_CONTRACT_ERROR', name);
+    assert.equal(result.structuredContent.status, 502, name);
+    assert.equal(result.structuredContent.retryable, false, name);
+    assert.match(result.structuredContent.next_action, /contract mismatch/i, name);
+  }
+});
+
+test('non-object upstream error bodies retain the typed error envelope', async (t) => {
+  for (const [label, body] of [
+    ['array', [{ error: 'bad gateway' }]],
+    ['string', 'bad gateway'],
+  ]) {
+    const connection = await connectedClient(baseFake({
+      async getDefaults() {
+        throw webhoundError('Upstream failed', {
+          code: 'API_UNAVAILABLE',
+          status: 502,
+          retryable: true,
+          body,
+          nextAction: 'Retry after the upstream service recovers.',
+        });
+      },
+    }));
+    const result = await connection.client.callTool({
+      name: 'webhound_get_defaults',
+      arguments: {},
+    });
+    await connection.close();
+    assert.equal(result.isError, true, label);
+    assert.equal(result.structuredContent.code, 'API_UNAVAILABLE', label);
+    assert.equal(result.structuredContent.status, 502, label);
+    assert.equal(result.structuredContent.retryable, true, label);
+    assert.deepEqual(result.structuredContent.body, { upstream_body: body }, label);
+    assert.match(result.structuredContent.next_action, /upstream service recovers/i, label);
+  }
+});
+
+test('authentication errors advertise the path-specific RFC 9728 resource metadata URL', async (t) => {
+  const connection = await connectedClient(baseFake({
+    async getDefaults() {
+      throw webhoundError('Authentication required', {
+        code: 'AUTH_REQUIRED',
+        status: 401,
+        retryable: false,
+      });
+    },
+  }));
+  t.after(() => connection.close());
+
+  const result = await connection.client.callTool({
+    name: 'webhound_get_defaults',
+    arguments: {},
+  });
+  assert.equal(result.isError, true);
+  assert.match(
+    result._meta?.['mcp/www_authenticate']?.[0] || '',
+    /resource_metadata="https:\/\/api\.webhound\.ai\/\.well-known\/oauth-protected-resource\/api\/v2\/mcp"/
+  );
+});
+
 test('missing sessions return a typed terminal error and never say to wait', async (t) => {
   const connection = await connectedClient(baseFake({
     async watch() {
@@ -218,6 +780,7 @@ test('missing sessions return a typed terminal error and never say to wait', asy
   assert.equal(result.structuredContent.ok, false);
   assert.equal(result.structuredContent.code, 'SESSION_NOT_FOUND');
   assert.equal(result.structuredContent.retryable, false);
+  assert.deepEqual(result.structuredContent.body, null);
   assert.doesNotMatch(result.structuredContent.next_action, /keep waiting/i);
 });
 
@@ -241,6 +804,238 @@ test('terminal sessions without final output fail honestly', async (t) => {
   assert.equal(result.structuredContent.code, 'EMPTY_OUTPUT');
   assert.equal(result.structuredContent.ok, false);
   assert.equal(outputCalled, false);
+});
+
+test('running output and evidence requests defer cleanly with diagnostics document summaries', async (t) => {
+  const diagnostics = {
+    session_id: 'running-report',
+    product: 'report',
+    status: 'researching',
+    done: false,
+    output_ready: false,
+    budget: 5,
+    cost: 1,
+    documents: {
+      count: 2,
+      output_word_count: 0,
+      available: [],
+    },
+    alerts: [],
+  };
+  const connection = await connectedClient(baseFake({
+    async watch() { return diagnostics; },
+    async getOutput() { throw new Error('deferred output must not be fetched'); },
+    async getSession() { throw new Error('deferred evidence must not be fetched'); },
+  }));
+  t.after(() => connection.close());
+
+  const output = await connection.client.callTool({
+    name: 'webhound_get_output',
+    arguments: { session_id: 'running-report', kind: 'report' },
+  });
+  assert.equal(output.isError, false);
+  assert.equal(output.structuredContent.output_deferred_until_done, true);
+  assert.equal(output.structuredContent.documents.count, 2);
+  assert.equal(output.structuredContent.mcp_next_action, 'wait');
+
+  const evidence = await connection.client.callTool({
+    name: 'webhound_get_evidence_pack',
+    arguments: { session_id: 'running-report', kind: 'report' },
+  });
+  assert.equal(evidence.isError, false);
+  assert.equal(evidence.structuredContent.evidence_pack_deferred_until_done, true);
+  assert.equal(evidence.structuredContent.documents.count, 2);
+  assert.equal(evidence.structuredContent.mcp_next_action, 'wait');
+});
+
+test('watch never marks terminal status successful without output readiness and artifact evidence', async (t) => {
+  for (const [label, watchResult] of [
+    ['not ready', {
+      session_id: 'not-ready',
+      product: 'report',
+      status: 'completed',
+      done: true,
+      output_ready: false,
+      documents: { output_word_count: 25 },
+      alerts: [],
+    }],
+    ['empty artifact', {
+      session_id: 'empty-artifact',
+      product: 'report',
+      status: 'completed',
+      done: true,
+      output_ready: true,
+      documents: { output_word_count: 0, available: [] },
+      alerts: [],
+    }],
+  ]) {
+    const connection = await connectedClient(baseFake({
+      async watch() { return watchResult; },
+    }));
+    const result = await connection.client.callTool({
+      name: 'webhound_watch',
+      arguments: { session_id: watchResult.session_id },
+    });
+    await connection.close();
+    assert.equal(result.structuredContent.successful_completion, false, label);
+    assert.equal(result.structuredContent.completion_state, 'empty_output', label);
+    assert.equal(result.structuredContent.alerts.some(alert => alert.code === 'EMPTY_OUTPUT'), true, label);
+    assert.notEqual(result.structuredContent.mcp_next_action, 'read_output', label);
+  }
+});
+
+test('completed status without artifact metadata stays unverified until output is fetched', async (t) => {
+  const connection = await connectedClient(baseFake({
+    async watch() {
+      return {
+        session_id: 'unverified-report',
+        product: 'report',
+        status: 'completed',
+        done: true,
+        output_ready: true,
+        completion_reason: 'natural_complete',
+        alerts: [],
+      };
+    },
+    async getOutput() {
+      return {
+        session_id: 'unverified-report',
+        content: '# Verified report',
+        doc_type: 'output',
+        is_output: true,
+      };
+    },
+  }));
+  t.after(() => connection.close());
+
+  const watched = await connection.client.callTool({
+    name: 'webhound_watch',
+    arguments: { session_id: 'unverified-report' },
+  });
+  assert.equal(watched.structuredContent.successful_completion, false);
+  assert.equal(watched.structuredContent.completion_state, 'output_unverified');
+  assert.equal(watched.structuredContent.mcp_next_action, 'read_output');
+
+  const output = await connection.client.callTool({
+    name: 'webhound_get_output',
+    arguments: { session_id: 'unverified-report', kind: 'report' },
+  });
+  assert.equal(output.isError, false);
+  assert.equal(output.structuredContent.complete_output, true);
+  assert.equal(output.structuredContent.content, undefined);
+  assert.equal(output.structuredContent.artifact.present, true);
+});
+
+test('evidence packs honor the canonical primary output and mark duplicate outputs superseded', async (t) => {
+  const connection = await connectedClient(baseFake({
+    async watch() {
+      return {
+        session_id: 'report-1',
+        product: 'report',
+        status: 'completed',
+        done: true,
+        output_ready: true,
+        completion_reason: 'natural_complete',
+        documents: { output_word_count: 3 },
+        alerts: [],
+      };
+    },
+    async getSession() {
+      return {
+        session_id: 'report-1',
+        session_type: 'research',
+        status: 'completed',
+        done: true,
+        output_ready: true,
+        documents: [
+          {
+            document_id: 'newer-empty',
+            doc_type: 'output',
+            is_output: true,
+            document_role: 'current_output',
+            document_state: 'current',
+            created_at: '2026-07-25T02:00:00.000Z',
+            content_markdown: '',
+          },
+          {
+            document_id: 'older-contentful',
+            doc_type: 'output',
+            is_output: true,
+            document_role: 'current_output',
+            document_state: 'current',
+            created_at: '2026-07-25T01:00:00.000Z',
+            content_markdown: '# Canonical final report',
+          },
+        ],
+        dataset: { schema: null, rows: [], row_count: 0 },
+        evidence: { claims: [], sources: [], claim_count: 0, source_count: 0 },
+        artifacts: {
+          primary_output_document_id: 'older-contentful',
+        },
+      };
+    },
+  }));
+  t.after(() => connection.close());
+
+  const result = await connection.client.callTool({
+    name: 'webhound_get_evidence_pack',
+    arguments: { session_id: 'report-1', kind: 'report' },
+  });
+  assert.equal(result.isError, false);
+  assert.equal(result.structuredContent.complete_evidence_pack, true);
+  assert.equal(result.structuredContent.artifact.present, true);
+  assert.equal(result.structuredContent.artifact.document_id, 'older-contentful');
+  assert.equal(result.structuredContent.artifacts.primary_output_document_id, 'older-contentful');
+  assert.equal(
+    result.structuredContent.documents.filter(document => document.document_role === 'current_output').length,
+    1
+  );
+  assert.equal(
+    result.structuredContent.documents.find(document => document.document_id === 'newer-empty').document_state,
+    'superseded'
+  );
+});
+
+test('working, latest-working, named-working, and archived report reads are never marked final', async (t) => {
+  const selections = new Map([
+    ['working:', { doc_name: 'Working notes', doc_type: 'working', is_output: false, content_markdown: '# Working' }],
+    ['latest:', { doc_name: 'Newest notes', doc_type: 'working', is_output: false, content_markdown: '# Latest working' }],
+    ['output:Working notes', { doc_name: 'Working notes', doc_type: 'working', is_output: false, content_markdown: '# Named working' }],
+    ['latest:Archived report', { doc_name: 'Archived report', doc_type: 'output_archived', is_output: true, content_markdown: '# Archived' }],
+  ]);
+  const connection = await connectedClient(baseFake({
+    async watch() {
+      return {
+        session_id: 'report-1',
+        product: 'report',
+        status: 'completed',
+        done: true,
+        output_ready: true,
+        completion_reason: 'natural_complete',
+        documents: { output_word_count: 50 },
+        alerts: [],
+      };
+    },
+    async getOutput(_sessionId, args) {
+      return selections.get(`${args.select}:${args.doc_name || ''}`);
+    },
+  }));
+  t.after(() => connection.close());
+
+  for (const arguments_ of [
+    { session_id: 'report-1', kind: 'report', select: 'working' },
+    { session_id: 'report-1', kind: 'report', select: 'latest' },
+    { session_id: 'report-1', kind: 'report', doc_name: 'Working notes' },
+    { session_id: 'report-1', kind: 'report', select: 'latest', doc_name: 'Archived report' },
+  ]) {
+    const result = await connection.client.callTool({
+      name: 'webhound_get_output',
+      arguments: arguments_,
+    });
+    assert.equal(result.isError, false, JSON.stringify(arguments_));
+    assert.equal(result.structuredContent.complete_output, false, JSON.stringify(arguments_));
+    assert.match(result.structuredContent.summary, /working or partial output snapshot/i, JSON.stringify(arguments_));
+  }
 });
 
 test('stopped sessions never turn an existing artifact into complete output', async (t) => {
@@ -337,7 +1132,15 @@ test('failed sessions return a stable actionable terminal code', async (t) => {
 test('binary download URL is a complete export delivery', async (t) => {
   const connection = await connectedClient(baseFake({
     async watch() {
-      return { session_id: 'report-1', product: 'report', status: 'completed', done: true, output_ready: true, alerts: [] };
+      return {
+        session_id: 'report-1',
+        product: 'report',
+        status: 'completed',
+        done: true,
+        output_ready: true,
+        documents: { output_word_count: 3 },
+        alerts: [],
+      };
     },
     async exportSession() {
       return {
@@ -359,6 +1162,39 @@ test('binary download URL is a complete export delivery', async (t) => {
   assert.equal(result.structuredContent.complete_export, true);
   assert.equal(result.structuredContent.delivery, 'download_url');
   assert.equal(result.structuredContent.content_base64, undefined);
+});
+
+test('empty export bytes never produce a complete delivery flag', async (t) => {
+  const connection = await connectedClient(baseFake({
+    async watch() {
+      return {
+        session_id: 'empty-export',
+        product: 'report',
+        status: 'completed',
+        done: true,
+        output_ready: true,
+        documents: { output_word_count: 3 },
+        alerts: [],
+      };
+    },
+    async exportSession() {
+      return {
+        filename: 'empty.md',
+        mime_type: 'text/markdown',
+        encoding: 'utf8',
+        content: '',
+        size_bytes: 0,
+      };
+    },
+  }));
+  t.after(() => connection.close());
+  const result = await connection.client.callTool({
+    name: 'webhound_export_session',
+    arguments: { session_id: 'empty-export', format: 'md' },
+  });
+  assert.equal(result.isError, true);
+  assert.equal(result.structuredContent.code, 'EMPTY_OUTPUT');
+  assert.equal(result.structuredContent.ok, false);
 });
 
 test('hosted onboarding is compact and start responses contain no rule-writing payload', async (t) => {
@@ -392,6 +1228,35 @@ test('hosted onboarding is compact and start responses contain no rule-writing p
   assert.equal(started.isError, false);
   assert.equal(started.structuredContent.onboarding_workspace_rule_prompt, undefined);
   assert.doesNotMatch(started.content[0].text, /workspace rules|setup pass/i);
+});
+
+test('onboarding tolerates additive top-level and nested capability fields', async (t) => {
+  const connection = await connectedClient(baseFake({
+    async onboarding() {
+      return {
+        account_state: { authenticated: true, ready_for_included_run: true },
+        free_run: { available: true },
+        billing: { credits: 0 },
+      };
+    },
+  }));
+  t.after(() => connection.close());
+
+  const result = await connection.client.callTool({
+    name: 'webhound_onboarding',
+    arguments: {
+      client: 'hosted',
+      future_input_field: { version: 2 },
+      capabilities: {
+        workspace_rules_supported: true,
+        future_capability: 'supported',
+        nested_capability_metadata: { source: 'hosted-client' },
+      },
+    },
+  });
+  assert.equal(result.isError, false);
+  assert.equal(result.structuredContent.workspace_rules.supported, true);
+  assert.equal(result.structuredContent.client_mode, 'hosted_oauth');
 });
 
 test('onboarding preserves account-state credits when billing has no balance', async (t) => {

@@ -13018,6 +13018,7 @@ var StdioServerTransport = class {
 
 // core/server.mjs
 import { lookup } from "node:dns/promises";
+import { request as httpsRequest } from "node:https";
 import { isIP } from "node:net";
 
 // node_modules/zod/v3/external.js
@@ -21360,13 +21361,12 @@ var EMPTY_COMPLETION_RESULT = {
 // core/webhoundClient.mjs
 import fs from "node:fs/promises";
 import path from "node:path";
+import { inflateRawSync } from "node:zlib";
 var DEFAULT_API_BASE = "https://api.webhound.ai/api/v2";
 var DEFAULT_APP_BASE = "https://webhound.ai";
 var MAX_UPLOAD_BYTES = 50 * 1024 * 1024;
 var ALLOWED_UPLOAD_MIME_TYPES = /* @__PURE__ */ new Set([
   "application/pdf",
-  "application/msword",
-  "application/vnd.ms-excel",
   "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
   "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
   "text/csv",
@@ -21377,10 +21377,8 @@ var ALLOWED_UPLOAD_MIME_TYPES = /* @__PURE__ */ new Set([
 var UPLOAD_MIME_BY_EXTENSION = Object.freeze({
   ".csv": "text/csv",
   ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-  ".xls": "application/vnd.ms-excel",
   ".pdf": "application/pdf",
   ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-  ".doc": "application/msword",
   ".txt": "text/plain",
   ".md": "text/markdown",
   ".vtt": "text/vtt"
@@ -21388,6 +21386,62 @@ var UPLOAD_MIME_BY_EXTENSION = Object.freeze({
 var UPLOAD_EXTENSION_BY_MIME = Object.freeze(Object.fromEntries(
   Object.entries(UPLOAD_MIME_BY_EXTENSION).map(([extension, mime]) => [mime, extension])
 ));
+var UPLOAD_MIME_ALIASES_BY_EXTENSION = Object.freeze({
+  ".csv": /* @__PURE__ */ new Set(["text/csv", "application/csv", "application/vnd.ms-excel", "application/octet-stream"]),
+  ".xlsx": /* @__PURE__ */ new Set(["application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "application/zip", "application/octet-stream"]),
+  ".pdf": /* @__PURE__ */ new Set(["application/pdf", "application/octet-stream"]),
+  ".docx": /* @__PURE__ */ new Set(["application/vnd.openxmlformats-officedocument.wordprocessingml.document", "application/zip", "application/octet-stream"]),
+  ".txt": /* @__PURE__ */ new Set(["text/plain", "application/octet-stream"]),
+  ".md": /* @__PURE__ */ new Set(["text/markdown", "text/plain", "application/octet-stream"]),
+  ".vtt": /* @__PURE__ */ new Set(["text/vtt", "text/plain", "application/octet-stream"])
+});
+var GENERIC_TRANSPORT_MIME_TYPES = /* @__PURE__ */ new Set([
+  "",
+  "application/octet-stream",
+  "application/zip"
+]);
+var MAX_ZIP_ENTRIES = 1e4;
+var MAX_ZIP_UNCOMPRESSED_BYTES = 200 * 1024 * 1024;
+var MAX_ZIP_COMPRESSION_RATIO = 1e3;
+var MAX_PACKAGE_CONTROL_XML_BYTES = 2 * 1024 * 1024;
+var MAX_PACKAGE_MAIN_XML_BYTES = 16 * 1024 * 1024;
+var ZIP_LOCAL_FILE_HEADER = 67324752;
+var ZIP_CENTRAL_DIRECTORY_HEADER = 33639248;
+var ZIP_END_OF_CENTRAL_DIRECTORY = 101010256;
+var ZIP_DATA_DESCRIPTOR = 134695760;
+var OPC_CONTENT_TYPES_NAMESPACE = "http://schemas.openxmlformats.org/package/2006/content-types";
+var OPC_RELATIONSHIPS_NAMESPACE = "http://schemas.openxmlformats.org/package/2006/relationships";
+var OOXML_PACKAGE = Object.freeze({
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document": {
+    mainPart: "word/document.xml",
+    contentType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml",
+    rootElement: "document",
+    namespaces: /* @__PURE__ */ new Set([
+      "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
+      "http://purl.oclc.org/ooxml/wordprocessingml/main"
+    ])
+  },
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": {
+    mainPart: "xl/workbook.xml",
+    contentType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml",
+    rootElement: "workbook",
+    namespaces: /* @__PURE__ */ new Set([
+      "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
+      "http://purl.oclc.org/ooxml/spreadsheetml/main"
+    ])
+  }
+});
+var CRC32_TABLE = (() => {
+  const table = new Uint32Array(256);
+  for (let value = 0; value < 256; value += 1) {
+    let crc = value;
+    for (let bit = 0; bit < 8; bit += 1) {
+      crc = (crc & 1) !== 0 ? 3988292384 ^ crc >>> 1 : crc >>> 1;
+    }
+    table[value] = crc >>> 0;
+  }
+  return table;
+})();
 var ERROR_CODES_BY_STATUS = Object.freeze({
   400: "VALIDATION_ERROR",
   401: "AUTH_REQUIRED",
@@ -21515,12 +21569,12 @@ function publicFullSession(value = {}) {
   if (Array.isArray(result.documents)) {
     result.documents = result.documents.map((document, index) => {
       const state = document.document_role === "current_output" ? "current" : document.doc_type === "output_archived" ? "archived" : "working";
-      const documentId = document.document_id || document.id || `${result.session_id || "session"}:document:${index + 1}`;
+      const documentId2 = document.document_id || document.id || `${result.session_id || "session"}:document:${index + 1}`;
       return {
         ...document,
-        document_id: documentId,
+        document_id: documentId2,
         document_state: state,
-        selection_key: documentId
+        selection_key: documentId2
       };
     });
   }
@@ -21534,6 +21588,14 @@ function publicSessionCollection(value = {}) {
       result[key] = result[key].map((item) => ({ ...publicSessionRecord(item), research_harness: "Hound" }));
     }
   }
+  const page = Number(result.page);
+  const pageSize = Number(result.limit ?? result.page_size);
+  const totalPages = Number(result.total_pages);
+  const total = Number(result.total ?? result.total_count);
+  if (Number.isFinite(page)) result.page = page;
+  if (Number.isFinite(pageSize)) result.limit = pageSize;
+  if (Number.isFinite(total)) result.total = total;
+  if (Number.isFinite(page) && Number.isFinite(totalPages)) result.has_more = page < totalPages;
   return result;
 }
 function publicOnboarding(value = {}) {
@@ -21565,25 +21627,36 @@ function normalizeMime(value = "") {
   return String(value || "").split(";", 1)[0].trim().toLowerCase();
 }
 function validateUploadMimeType(mimeType, fileName) {
+  const extension = path.extname(fileName || "").toLowerCase();
   const inferred = mimeFromFilename(fileName);
   const normalized = normalizeMime(mimeType || inferred);
+  const aliases = UPLOAD_MIME_ALIASES_BY_EXTENSION[extension];
+  if (aliases) {
+    if (normalized && !aliases.has(normalized)) {
+      throw webhoundError(`Filename "${fileName}" does not match declared MIME type "${normalized}".`, {
+        code: "MIME_MISMATCH",
+        status: 415,
+        retryable: false,
+        nextAction: "Use a filename extension that matches the validated MIME type."
+      });
+    }
+    return inferred;
+  }
   if (!ALLOWED_UPLOAD_MIME_TYPES.has(normalized)) {
     throw webhoundError(`Unsupported upload MIME type "${normalized || "unknown"}".`, {
       code: "UNSUPPORTED_MEDIA_TYPE",
       status: 415,
       retryable: false,
-      nextAction: "Use CSV, XLSX, XLS, PDF, DOCX, DOC, TXT, Markdown, or VTT."
-    });
-  }
-  if (mimeType && inferred !== "application/octet-stream" && inferred !== normalized) {
-    throw webhoundError(`Filename "${fileName}" does not match declared MIME type "${normalized}".`, {
-      code: "MIME_MISMATCH",
-      status: 415,
-      retryable: false,
-      nextAction: "Use a filename extension that matches the validated MIME type."
+      nextAction: "Use CSV, XLSX, PDF, DOCX, TXT, Markdown, or VTT. Convert legacy .xls/.doc files to .xlsx/.docx first."
     });
   }
   return normalized;
+}
+function preferredUploadMimeType(clientMimeType, responseMimeType, fileName) {
+  const clientMime = normalizeMime(clientMimeType);
+  const responseMime = normalizeMime(responseMimeType);
+  const declared = GENERIC_TRANSPORT_MIME_TYPES.has(clientMime) ? responseMime || clientMime : clientMime || responseMime;
+  return validateUploadMimeType(declared, fileName);
 }
 function safeUploadFilename(baseName, mimeType) {
   const normalized = validateUploadMimeType(mimeType);
@@ -21593,6 +21666,14 @@ function safeUploadFilename(baseName, mimeType) {
 }
 function decodeBase64Strict(value) {
   const input = String(value || "");
+  const maximumEncodedLength = 4 * Math.ceil(MAX_UPLOAD_BYTES / 3);
+  if (input.length > maximumEncodedLength) {
+    throw webhoundError(`The uploaded file exceeds Webhound's ${MAX_UPLOAD_BYTES / (1024 * 1024)} MB limit.`, {
+      code: "FILE_TOO_LARGE",
+      status: 413,
+      retryable: false
+    });
+  }
   if (!input || input.length % 4 !== 0 || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(input)) {
     throw webhoundError("content_base64 must be non-empty, canonical base64 without whitespace or invalid characters.", {
       code: "INVALID_BASE64",
@@ -21602,6 +21683,14 @@ function decodeBase64Strict(value) {
     });
   }
   const bytes = Buffer.from(input, "base64");
+  if (bytes.toString("base64") !== input) {
+    throw webhoundError("content_base64 is not a canonical encoding of the supplied bytes.", {
+      code: "INVALID_BASE64",
+      status: 400,
+      retryable: false,
+      nextAction: "Encode the original file bytes as standard base64 and retry."
+    });
+  }
   if (bytes.length === 0) {
     throw webhoundError("content_base64 decoded to an empty file.", {
       code: "EMPTY_FILE",
@@ -21627,17 +21716,283 @@ function assertUploadSize(bytes) {
     });
   }
 }
+function crc32(buffer) {
+  let crc = 4294967295;
+  for (const byte of buffer) crc = CRC32_TABLE[(crc ^ byte) & 255] ^ crc >>> 8;
+  return (crc ^ 4294967295) >>> 0;
+}
+function findZipEndOfCentralDirectory(buffer) {
+  const minimumOffset = Math.max(0, buffer.length - (65535 + 22));
+  for (let offset = buffer.length - 22; offset >= minimumOffset; offset -= 1) {
+    if (buffer.readUInt32LE(offset) === ZIP_END_OF_CENTRAL_DIRECTORY) return offset;
+  }
+  return -1;
+}
+function decodeZipFilename(bytes, flags) {
+  const filename = bytes.toString((flags & 2048) !== 0 ? "utf8" : "latin1");
+  if (!filename || /[\u0000-\u001f\u007f]/.test(filename) || filename.includes("\uFFFD")) return null;
+  if (filename.includes("\\") || filename.startsWith("/") || /^[A-Za-z]:/.test(filename)) return null;
+  if (filename.split("/").some((part) => part === "." || part === "..")) return null;
+  return filename;
+}
+function parseZipArchive(buffer) {
+  const endOffset = findZipEndOfCentralDirectory(buffer);
+  if (endOffset < 0) return null;
+  const diskNumber = buffer.readUInt16LE(endOffset + 4);
+  const directoryDisk = buffer.readUInt16LE(endOffset + 6);
+  const entriesOnDisk = buffer.readUInt16LE(endOffset + 8);
+  const totalEntries = buffer.readUInt16LE(endOffset + 10);
+  const directorySize = buffer.readUInt32LE(endOffset + 12);
+  const directoryOffset = buffer.readUInt32LE(endOffset + 16);
+  const commentLength = buffer.readUInt16LE(endOffset + 20);
+  if (diskNumber !== 0 || directoryDisk !== 0 || entriesOnDisk !== totalEntries) return null;
+  if (totalEntries === 0 || totalEntries > MAX_ZIP_ENTRIES || totalEntries === 65535) return null;
+  if (directorySize === 4294967295 || directoryOffset === 4294967295) return null;
+  if (endOffset + 22 + commentLength !== buffer.length || directoryOffset + directorySize !== endOffset) return null;
+  let offset = directoryOffset;
+  let uncompressedTotal = 0;
+  const entries = [];
+  const entryNames = /* @__PURE__ */ new Set();
+  for (let index = 0; index < totalEntries; index += 1) {
+    if (offset + 46 > endOffset || buffer.readUInt32LE(offset) !== ZIP_CENTRAL_DIRECTORY_HEADER) return null;
+    const flags = buffer.readUInt16LE(offset + 8);
+    const method = buffer.readUInt16LE(offset + 10);
+    const checksum = buffer.readUInt32LE(offset + 16);
+    const compressedSize = buffer.readUInt32LE(offset + 20);
+    const uncompressedSize = buffer.readUInt32LE(offset + 24);
+    const filenameLength = buffer.readUInt16LE(offset + 28);
+    const extraLength = buffer.readUInt16LE(offset + 30);
+    const commentLengthForEntry = buffer.readUInt16LE(offset + 32);
+    const diskStart = buffer.readUInt16LE(offset + 34);
+    const localHeaderOffset = buffer.readUInt32LE(offset + 42);
+    const nextOffset = offset + 46 + filenameLength + extraLength + commentLengthForEntry;
+    if (nextOffset > endOffset || (flags & 1) !== 0) return null;
+    if (![0, 8].includes(method) || diskStart !== 0 || localHeaderOffset === 4294967295) return null;
+    if (compressedSize === 4294967295 || uncompressedSize === 4294967295) return null;
+    const filename = decodeZipFilename(buffer.subarray(offset + 46, offset + 46 + filenameLength), flags);
+    if (!filename || entryNames.has(filename)) return null;
+    entryNames.add(filename);
+    uncompressedTotal += uncompressedSize;
+    if (uncompressedTotal > MAX_ZIP_UNCOMPRESSED_BYTES) return null;
+    if (compressedSize === 0 && uncompressedSize > 0) return null;
+    if (compressedSize > 0 && uncompressedSize / compressedSize > MAX_ZIP_COMPRESSION_RATIO) return null;
+    entries.push({ filename, flags, method, checksum, compressedSize, uncompressedSize, localHeaderOffset });
+    offset = nextOffset;
+  }
+  if (offset !== directoryOffset + directorySize) return null;
+  const ranges = [];
+  for (const entry of entries) {
+    const localOffset = entry.localHeaderOffset;
+    if (localOffset + 30 > directoryOffset || buffer.readUInt32LE(localOffset) !== ZIP_LOCAL_FILE_HEADER) return null;
+    const localFlags = buffer.readUInt16LE(localOffset + 6);
+    const localMethod = buffer.readUInt16LE(localOffset + 8);
+    const localChecksum = buffer.readUInt32LE(localOffset + 14);
+    const localCompressedSize = buffer.readUInt32LE(localOffset + 18);
+    const localUncompressedSize = buffer.readUInt32LE(localOffset + 22);
+    const localNameLength = buffer.readUInt16LE(localOffset + 26);
+    const localExtraLength = buffer.readUInt16LE(localOffset + 28);
+    const localNameEnd = localOffset + 30 + localNameLength;
+    const dataOffset = localNameEnd + localExtraLength;
+    const dataEnd = dataOffset + entry.compressedSize;
+    if (localNameEnd > directoryOffset || dataOffset > directoryOffset || dataEnd > directoryOffset) return null;
+    const localFilename = decodeZipFilename(buffer.subarray(localOffset + 30, localNameEnd), localFlags);
+    if (localFilename !== entry.filename || localFlags !== entry.flags || localMethod !== entry.method) return null;
+    let rangeEnd = dataEnd;
+    if ((entry.flags & 8) === 0) {
+      if (localChecksum !== entry.checksum || localCompressedSize !== entry.compressedSize || localUncompressedSize !== entry.uncompressedSize) return null;
+    } else {
+      const hasSignature = dataEnd + 4 <= directoryOffset && buffer.readUInt32LE(dataEnd) === ZIP_DATA_DESCRIPTOR;
+      const descriptorOffset = dataEnd + (hasSignature ? 4 : 0);
+      if (descriptorOffset + 12 > directoryOffset) return null;
+      if (buffer.readUInt32LE(descriptorOffset) !== entry.checksum || buffer.readUInt32LE(descriptorOffset + 4) !== entry.compressedSize || buffer.readUInt32LE(descriptorOffset + 8) !== entry.uncompressedSize) return null;
+      rangeEnd = descriptorOffset + 12;
+    }
+    entry.dataOffset = dataOffset;
+    ranges.push({ start: localOffset, end: rangeEnd });
+  }
+  ranges.sort((left, right) => left.start - right.start);
+  if (ranges[0]?.start !== 0 || ranges.at(-1)?.end !== directoryOffset) return null;
+  for (let index = 1; index < ranges.length; index += 1) {
+    if (ranges[index].start !== ranges[index - 1].end) return null;
+  }
+  return { entries, byName: new Map(entries.map((entry) => [entry.filename, entry])) };
+}
+function extractZipEntry(buffer, entry, maxBytes) {
+  if (!entry || entry.uncompressedSize > maxBytes) return null;
+  const compressed = buffer.subarray(entry.dataOffset, entry.dataOffset + entry.compressedSize);
+  let content;
+  try {
+    content = entry.method === 0 ? Buffer.from(compressed) : inflateRawSync(compressed, { maxOutputLength: Math.max(maxBytes, 1) });
+  } catch {
+    return null;
+  }
+  if (content.length !== entry.uncompressedSize || crc32(content) !== entry.checksum) return null;
+  return content;
+}
+function safeXml(buffer) {
+  if (!buffer || buffer.includes(0)) return null;
+  const xml = buffer.toString("utf8").replace(/^\uFEFF/, "");
+  if (!xml.trimStart().startsWith("<") || xml.includes("\uFFFD") || /<!DOCTYPE/i.test(xml)) return null;
+  return xml;
+}
+function xmlAttributes(fragment) {
+  const attributes = {};
+  let offset = 0;
+  while (offset < fragment.length) {
+    while (/\s/.test(fragment[offset] || "")) offset += 1;
+    if (offset >= fragment.length) break;
+    const nameMatch = /^[A-Za-z_:][A-Za-z0-9_.:-]*/.exec(fragment.slice(offset));
+    if (!nameMatch) return null;
+    const name = nameMatch[0];
+    if (Object.hasOwn(attributes, name)) return null;
+    offset += name.length;
+    while (/\s/.test(fragment[offset] || "")) offset += 1;
+    if (fragment[offset] !== "=") return null;
+    offset += 1;
+    while (/\s/.test(fragment[offset] || "")) offset += 1;
+    const quote = fragment[offset];
+    if (quote !== '"' && quote !== "'") return null;
+    const valueEnd = fragment.indexOf(quote, offset + 1);
+    if (valueEnd < 0) return null;
+    attributes[name] = fragment.slice(offset + 1, valueEnd);
+    offset = valueEnd + 1;
+  }
+  return attributes;
+}
+function findXmlTagEnd(xml, start) {
+  let quote = null;
+  for (let offset = start; offset < xml.length; offset += 1) {
+    const character = xml[offset];
+    if (quote) {
+      if (character === quote) quote = null;
+    } else if (character === '"' || character === "'") {
+      quote = character;
+    } else if (character === ">") {
+      return offset;
+    }
+  }
+  return -1;
+}
+function parseXmlDocument(xml) {
+  if (!xml) return null;
+  const stack = [];
+  const elements = [];
+  let root = null;
+  let offset = 0;
+  while (offset < xml.length) {
+    const tagStart = xml.indexOf("<", offset);
+    if (tagStart < 0) {
+      if (stack.length === 0 && xml.slice(offset).trim()) return null;
+      break;
+    }
+    if (stack.length === 0 && xml.slice(offset, tagStart).trim()) return null;
+    if (xml.startsWith("<!--", tagStart)) {
+      const end = xml.indexOf("-->", tagStart + 4);
+      if (end < 0) return null;
+      offset = end + 3;
+      continue;
+    }
+    if (xml.startsWith("<![CDATA[", tagStart)) {
+      if (stack.length === 0) return null;
+      const end = xml.indexOf("]]>", tagStart + 9);
+      if (end < 0) return null;
+      offset = end + 3;
+      continue;
+    }
+    if (xml.startsWith("<?", tagStart)) {
+      const end = xml.indexOf("?>", tagStart + 2);
+      if (end < 0) return null;
+      offset = end + 2;
+      continue;
+    }
+    if (xml.startsWith("<!", tagStart)) return null;
+    const tagEnd = findXmlTagEnd(xml, tagStart + 1);
+    if (tagEnd < 0) return null;
+    let body = xml.slice(tagStart + 1, tagEnd).trim();
+    if (!body) return null;
+    if (body.startsWith("/")) {
+      const closingName = body.slice(1).trim();
+      if (!/^[A-Za-z_:][A-Za-z0-9_.:-]*$/.test(closingName) || stack.pop()?.name !== closingName) return null;
+      offset = tagEnd + 1;
+      continue;
+    }
+    const selfClosing = /\/\s*$/.test(body);
+    if (selfClosing) body = body.replace(/\/\s*$/, "").trimEnd();
+    const nameMatch = /^[A-Za-z_:][A-Za-z0-9_.:-]*/.exec(body);
+    if (!nameMatch) return null;
+    const name = nameMatch[0];
+    const attributes = xmlAttributes(body.slice(name.length));
+    if (!attributes) return null;
+    const namespaces = new Map(stack.at(-1)?.namespaces || []);
+    for (const [attributeName, value] of Object.entries(attributes)) {
+      if (attributeName === "xmlns") namespaces.set("", value);
+      else if (attributeName.startsWith("xmlns:")) namespaces.set(attributeName.slice(6), value);
+    }
+    const prefix = name.includes(":") ? name.slice(0, name.indexOf(":")) : "";
+    const namespaceUri = namespaces.get(prefix) || null;
+    if (stack.length === 0) {
+      if (root) return null;
+      root = name;
+    }
+    elements.push({
+      name,
+      localName: name.includes(":") ? name.slice(name.lastIndexOf(":") + 1) : name,
+      attributes,
+      namespaceUri
+    });
+    if (!selfClosing) stack.push({ name, namespaces });
+    offset = tagEnd + 1;
+  }
+  if (!root || stack.length !== 0) return null;
+  return {
+    root,
+    rootLocalName: root.includes(":") ? root.slice(root.lastIndexOf(":") + 1) : root,
+    elements
+  };
+}
+function normalizeRelationshipTarget(value) {
+  const target = String(value || "");
+  if (!target || target.includes("\\") || target.includes("\0") || target.startsWith("//") || /^[A-Za-z][A-Za-z0-9+.-]*:/.test(target) || /[?#]/.test(target) || target.split("/").some((part) => part === "..")) {
+    return null;
+  }
+  return path.posix.normalize(`/${target}`).replace(/^\/+/, "") || null;
+}
+function inspectOoxmlArchive(mimeType, buffer) {
+  const definition = OOXML_PACKAGE[mimeType];
+  if (!definition || buffer.length < 4 || buffer.readUInt32LE(0) !== ZIP_LOCAL_FILE_HEADER) return false;
+  const archive = parseZipArchive(buffer);
+  if (!archive) return false;
+  for (const entry of archive.entries) {
+    if (extractZipEntry(buffer, entry, entry.uncompressedSize) === null) return false;
+  }
+  const contentTypes = parseXmlDocument(safeXml(extractZipEntry(
+    buffer,
+    archive.byName.get("[Content_Types].xml"),
+    MAX_PACKAGE_CONTROL_XML_BYTES
+  )));
+  const relationships = parseXmlDocument(safeXml(extractZipEntry(
+    buffer,
+    archive.byName.get("_rels/.rels"),
+    MAX_PACKAGE_CONTROL_XML_BYTES
+  )));
+  const mainDocument = parseXmlDocument(safeXml(extractZipEntry(
+    buffer,
+    archive.byName.get(definition.mainPart),
+    MAX_PACKAGE_MAIN_XML_BYTES
+  )));
+  if (!contentTypes || !relationships || !mainDocument) return false;
+  if (contentTypes.rootLocalName !== "Types" || relationships.rootLocalName !== "Relationships" || mainDocument.rootLocalName !== definition.rootElement) return false;
+  if (contentTypes.elements[0]?.namespaceUri !== OPC_CONTENT_TYPES_NAMESPACE || relationships.elements[0]?.namespaceUri !== OPC_RELATIONSHIPS_NAMESPACE || !definition.namespaces.has(mainDocument.elements[0]?.namespaceUri)) return false;
+  const hasContentType = contentTypes.elements.some((element) => element.localName === "Override" && element.namespaceUri === OPC_CONTENT_TYPES_NAMESPACE && element.attributes.PartName === `/${definition.mainPart}` && element.attributes.ContentType === definition.contentType);
+  const hasOfficeRelationship = relationships.elements.some((element) => element.localName === "Relationship" && element.namespaceUri === OPC_RELATIONSHIPS_NAMESPACE && String(element.attributes.Type || "").endsWith("/officeDocument") && String(element.attributes.TargetMode || "").toLowerCase() !== "external" && normalizeRelationshipTarget(element.attributes.Target) === definition.mainPart);
+  return hasContentType && hasOfficeRelationship;
+}
 function assertMimeMatchesBytes(bytes, mimeType) {
-  const starts = (...values) => values.every((value, index) => bytes[index] === value);
   const isPdf = bytes.subarray(0, 5).toString("ascii") === "%PDF-";
-  const isZip = starts(80, 75, 3, 4) || starts(80, 75, 5, 6) || starts(80, 75, 7, 8);
-  const isCompoundDocument = starts(208, 207, 17, 224, 161, 177, 26, 225);
   const checks = {
     "application/pdf": isPdf,
-    "application/msword": isCompoundDocument,
-    "application/vnd.ms-excel": isCompoundDocument,
-    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": isZip,
-    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": isZip
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": inspectOoxmlArchive(mimeType, bytes),
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": inspectOoxmlArchive(mimeType, bytes)
   };
   if (Object.hasOwn(checks, mimeType) && !checks[mimeType]) {
     throw webhoundError(`File bytes do not match declared MIME type "${mimeType}".`, {
@@ -21700,110 +22055,230 @@ function datasetCellClaims(full, sessionId) {
   });
   return claims;
 }
-function normalizeAttributeType(value) {
-  const raw = Array.isArray(value) ? value.find((item) => item !== "null") : value;
-  if (raw === "integer") return "number";
-  if (["string", "number", "boolean", "object"].includes(raw)) return raw;
-  return "string";
+var MAX_DATASET_ATTRIBUTES = 200;
+var DATASET_ATTRIBUTE_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_.-]{0,127}$/;
+var DATASET_JSON_TYPES = /* @__PURE__ */ new Set(["string", "number", "integer", "boolean", "array", "object"]);
+function datasetSchemaError(message, nextAction = null) {
+  throw webhoundError(message, {
+    code: "INVALID_DATASET_SCHEMA",
+    status: 400,
+    retryable: false,
+    nextAction: nextAction || "Use a Webhound native attributes schema or a standard object JSON Schema."
+  });
+}
+function datasetString(value, field, { required: required2 = false, max = 2e3 } = {}) {
+  if (value == null || value === "") {
+    if (required2) datasetSchemaError(`${field} is required.`);
+    return "";
+  }
+  if (typeof value !== "string") datasetSchemaError(`${field} must be a string.`);
+  const normalized = value.trim();
+  if (required2 && !normalized) datasetSchemaError(`${field} is required.`);
+  if (normalized.length > max) datasetSchemaError(`${field} must be at most ${max} characters.`);
+  return normalized;
+}
+function datasetStringArray(value, field) {
+  if (value == null) return [];
+  if (!Array.isArray(value) || value.some((item) => typeof item !== "string" || !item.trim())) {
+    datasetSchemaError(`${field} must be an array of non-empty strings.`);
+  }
+  return [...new Set(value.map((item) => item.trim()))];
+}
+function datasetAttributeName(value, field) {
+  const name = datasetString(value, field, { required: true, max: 128 });
+  if (!DATASET_ATTRIBUTE_NAME_PATTERN.test(name)) {
+    datasetSchemaError(`${field} must start with a letter or underscore and contain only letters, numbers, "_", "-", or ".".`);
+  }
+  return name;
+}
+function normalizeDatasetNativeType(type, field) {
+  const value = datasetString(type || "string", field, { required: true, max: 40 }).toLowerCase();
+  const aliases = {
+    text: "string",
+    integer: "number",
+    int: "number",
+    float: "number",
+    double: "number",
+    url: "string",
+    email: "string",
+    date: "string",
+    datetime: "string"
+  };
+  const normalized = aliases[value] || value;
+  if (!["string", "number", "boolean", "object"].includes(normalized)) {
+    datasetSchemaError(`${field} has unsupported type "${value}".`);
+  }
+  return normalized;
+}
+function normalizeDatasetFormat(format) {
+  if (!format) return null;
+  const known = {
+    "date-time": "ISO 8601 date and time",
+    date: "ISO 8601 date (YYYY-MM-DD)",
+    email: "Valid email address",
+    uri: "Absolute URL",
+    url: "Absolute URL",
+    hostname: "DNS hostname",
+    ipv4: "IPv4 address",
+    ipv6: "IPv6 address",
+    uuid: "UUID"
+  };
+  return known[String(format).toLowerCase()] || `JSON Schema format: ${String(format).slice(0, 120)}`;
+}
+function normalizeNativeDatasetSchema(schema) {
+  const entityObject = schema.entity && typeof schema.entity === "object" && !Array.isArray(schema.entity) ? schema.entity : {};
+  const entityName = datasetString(
+    entityObject.name || schema.entity_name,
+    "schema.entity.name",
+    { required: true, max: 160 }
+  );
+  const entityDescription = datasetString(
+    entityObject.description ?? schema.entity_description ?? "",
+    "schema.entity.description",
+    { max: 4e3 }
+  );
+  const criteria = datasetStringArray(
+    entityObject.criteria ?? schema.entity_criteria ?? [],
+    "schema.entity.criteria"
+  );
+  if (!Array.isArray(schema.attributes) || schema.attributes.length === 0) {
+    datasetSchemaError("schema.attributes must contain at least one attribute.");
+  }
+  if (schema.attributes.length > MAX_DATASET_ATTRIBUTES) {
+    datasetSchemaError(`schema.attributes cannot contain more than ${MAX_DATASET_ATTRIBUTES} attributes.`);
+  }
+  const seen = /* @__PURE__ */ new Set();
+  const attributes = schema.attributes.map((attribute, index) => {
+    if (!attribute || typeof attribute !== "object" || Array.isArray(attribute)) {
+      datasetSchemaError(`schema.attributes[${index}] must be an object.`);
+    }
+    const name = datasetAttributeName(attribute.name, `schema.attributes[${index}].name`);
+    if (seen.has(name)) datasetSchemaError(`schema.attributes contains duplicate name "${name}".`);
+    seen.add(name);
+    const isArray = attribute.is_array === true || String(attribute.type || "").toLowerCase() === "array";
+    const rawType = isArray ? attribute.items?.type || attribute.item_type || "string" : attribute.type || "string";
+    return {
+      name,
+      description: datasetString(
+        attribute.description || "",
+        `schema.attributes[${index}].description`,
+        { max: 2e3 }
+      ),
+      type: normalizeDatasetNativeType(rawType, `schema.attributes[${index}].type`),
+      is_array: isArray,
+      is_primary: attribute.is_primary === true,
+      required: attribute.required === true || attribute.is_primary === true,
+      standard_format: datasetString(
+        attribute.standard_format || normalizeDatasetFormat(attribute.format) || "",
+        `schema.attributes[${index}].standard_format`,
+        { max: 500 }
+      ) || null,
+      action: "add"
+    };
+  });
+  if (!attributes.some((attribute) => attribute.is_primary)) {
+    datasetSchemaError(
+      "Native schema must mark at least one attribute with is_primary: true.",
+      "Mark the stable entity identifier field with is_primary: true."
+    );
+  }
+  return {
+    entity: { name: entityName, description: entityDescription, criteria },
+    entity_name: entityName,
+    entity_description: entityDescription,
+    entity_criteria: criteria,
+    attributes
+  };
+}
+function datasetPropertyType(property, field) {
+  const rawType = Array.isArray(property.type) ? property.type.find((type) => type !== "null") : property.type;
+  if (!rawType || !DATASET_JSON_TYPES.has(rawType)) {
+    datasetSchemaError(`${field}.type must be one of string, number, integer, boolean, array, or object.`);
+  }
+  if (rawType === "array") {
+    const itemType = Array.isArray(property.items?.type) ? property.items.type.find((type) => type !== "null") : property.items?.type;
+    if (!itemType || !DATASET_JSON_TYPES.has(itemType) || itemType === "array") {
+      datasetSchemaError(`${field}.items.type is required for arrays and cannot itself be an array.`);
+    }
+    return { type: normalizeDatasetNativeType(itemType, `${field}.items.type`), isArray: true };
+  }
+  return { type: normalizeDatasetNativeType(rawType, `${field}.type`), isArray: false };
+}
+function normalizeObjectDatasetSchema(schema) {
+  if (schema.type !== "object") datasetSchemaError('JSON Schema root type must be "object".');
+  if (!schema.properties || typeof schema.properties !== "object" || Array.isArray(schema.properties)) {
+    datasetSchemaError("JSON Schema properties must be a non-empty object.");
+  }
+  const entries = Object.entries(schema.properties);
+  if (entries.length === 0) datasetSchemaError("JSON Schema properties must be a non-empty object.");
+  if (entries.length > MAX_DATASET_ATTRIBUTES) {
+    datasetSchemaError(`JSON Schema cannot contain more than ${MAX_DATASET_ATTRIBUTES} properties.`);
+  }
+  const required2 = new Set(datasetStringArray(schema.required || [], "schema.required"));
+  for (const requiredName of required2) {
+    if (!Object.hasOwn(schema.properties, requiredName)) {
+      datasetSchemaError(`schema.required references unknown property "${requiredName}".`);
+    }
+  }
+  const declaredPrimary = datasetStringArray(
+    schema["x-webhound-primary-key"] == null ? [] : Array.isArray(schema["x-webhound-primary-key"]) ? schema["x-webhound-primary-key"] : [schema["x-webhound-primary-key"]],
+    "schema.x-webhound-primary-key"
+  );
+  for (const primaryName of declaredPrimary) {
+    if (!Object.hasOwn(schema.properties, primaryName)) {
+      datasetSchemaError(`schema.x-webhound-primary-key references unknown property "${primaryName}".`);
+    }
+  }
+  const propertyPrimary = entries.filter(([, property]) => property?.["x-webhound-primary"] === true).map(([name]) => name);
+  let primaryNames = [.../* @__PURE__ */ new Set([...declaredPrimary, ...propertyPrimary])];
+  if (primaryNames.length === 0) {
+    primaryNames = [entries.find(([name]) => required2.has(name))?.[0] || entries[0][0]];
+  }
+  const primarySet = new Set(primaryNames);
+  const attributes = entries.map(([rawName, property], index) => {
+    const name = datasetAttributeName(rawName, `schema.properties key ${index}`);
+    if (!property || typeof property !== "object" || Array.isArray(property)) {
+      datasetSchemaError(`schema.properties.${name} must be an object.`);
+    }
+    const resolved = datasetPropertyType(property, `schema.properties.${name}`);
+    return {
+      name,
+      description: datasetString(
+        property.description || property.title || "",
+        `schema.properties.${name}.description`,
+        { max: 2e3 }
+      ),
+      type: resolved.type,
+      is_array: resolved.isArray,
+      is_primary: primarySet.has(name),
+      required: required2.has(name) || primarySet.has(name),
+      standard_format: datasetString(
+        normalizeDatasetFormat(property.format) || "",
+        `schema.properties.${name}.format`,
+        { max: 500 }
+      ) || null,
+      action: "add"
+    };
+  });
+  const entityName = datasetString(schema.title || "Extracted entity", "schema.title", { required: true, max: 160 });
+  const entityDescription = datasetString(schema.description || "", "schema.description", { max: 4e3 });
+  return {
+    entity: { name: entityName, description: entityDescription, criteria: [] },
+    entity_name: entityName,
+    entity_description: entityDescription,
+    entity_criteria: [],
+    attributes
+  };
 }
 function normalizeDatasetSchema(schema) {
   if (schema === void 0 || schema === null) return void 0;
   if (!schema || typeof schema !== "object" || Array.isArray(schema)) {
-    throw webhoundError("Dataset schema must be either a native Webhound schema or an object JSON Schema.", {
-      code: "INVALID_DATASET_SCHEMA",
-      status: 400,
-      retryable: false
-    });
+    datasetSchemaError("Dataset schema must be either a native Webhound schema or an object JSON Schema.");
   }
-  if (Array.isArray(schema.attributes)) {
-    if (schema.attributes.length === 0) {
-      throw webhoundError("Native dataset schema attributes must contain at least one field.", {
-        code: "INVALID_DATASET_SCHEMA",
-        status: 400,
-        retryable: false
-      });
-    }
-    if (schema.attributes.length > 200) {
-      throw webhoundError("Native dataset schemas support at most 200 attributes.", {
-        code: "INVALID_DATASET_SCHEMA",
-        status: 400,
-        retryable: false
-      });
-    }
-    const attributes = schema.attributes.map((attribute) => {
-      if (attribute.type === "array") {
-        throw webhoundError(`Native attribute "${attribute.name}" cannot use type: "array".`, {
-          code: "INVALID_DATASET_SCHEMA",
-          status: 400,
-          retryable: false,
-          nextAction: "Use the scalar item type and set is_array: true."
-        });
-      }
-      return {
-        name: String(attribute.name).trim(),
-        description: attribute.description ? String(attribute.description) : void 0,
-        type: normalizeAttributeType(attribute.type),
-        is_array: attribute.is_array === true,
-        is_primary: attribute.is_primary === true,
-        standard_format: attribute.standard_format ? String(attribute.standard_format) : void 0
-      };
-    });
-    if (!attributes.some((attribute) => attribute.is_primary)) {
-      throw webhoundError("Native dataset schema must mark at least one attribute with is_primary: true.", {
-        code: "INVALID_DATASET_SCHEMA",
-        status: 400,
-        retryable: false,
-        nextAction: "Mark the stable entity identifier field with is_primary: true."
-      });
-    }
-    return {
-      entity_name: String(schema.entity_name || schema.entity?.name || "Entity").trim(),
-      entity_description: schema.entity_description || schema.entity?.description || void 0,
-      entity_criteria: schema.entity_criteria || schema.entity?.criteria || void 0,
-      attributes
-    };
+  if (schema.type === "object" || schema.properties !== void 0 || schema.$schema) {
+    return normalizeObjectDatasetSchema(schema);
   }
-  if (schema.type !== "object" || !schema.properties || typeof schema.properties !== "object" || Array.isArray(schema.properties)) {
-    throw webhoundError('JSON Schema datasets require type: "object" and a non-empty properties object.', {
-      code: "INVALID_DATASET_SCHEMA",
-      status: 400,
-      retryable: false
-    });
-  }
-  const entries = Object.entries(schema.properties);
-  if (entries.length === 0) {
-    throw webhoundError("JSON Schema properties must contain at least one field.", {
-      code: "INVALID_DATASET_SCHEMA",
-      status: 400,
-      retryable: false
-    });
-  }
-  if (entries.length > 200) {
-    throw webhoundError("Object JSON Schemas support at most 200 properties.", {
-      code: "INVALID_DATASET_SCHEMA",
-      status: 400,
-      retryable: false
-    });
-  }
-  const explicitPrimary = entries.find(([, property]) => property?.["x-webhound-primary"] === true || property?.["x-primary-key"] === true)?.[0];
-  const required2 = Array.isArray(schema.required) ? schema.required : [];
-  const primaryName = explicitPrimary || required2.find((name) => Object.hasOwn(schema.properties, name)) || entries[0][0];
-  return {
-    entity_name: String(schema.title || "Entity").trim(),
-    entity_description: schema.description ? String(schema.description) : void 0,
-    attributes: entries.map(([name, property = {}]) => {
-      const rawType = Array.isArray(property.type) ? property.type.find((item) => item !== "null") : property.type;
-      const itemType = rawType === "array" ? property.items?.type : rawType;
-      return {
-        name,
-        description: property.description ? String(property.description) : void 0,
-        type: normalizeAttributeType(itemType),
-        is_array: rawType === "array",
-        is_primary: name === primaryName,
-        standard_format: property.format ? String(property.format) : void 0
-      };
-    })
-  };
+  return normalizeNativeDatasetSchema(schema);
 }
 var WebhoundApiClient = class {
   constructor({ apiBase, appBase, apiKey, internalSecret = "", allowLocalFiles = false }) {
@@ -22165,6 +22640,7 @@ var WebhoundApiClient = class {
     const data = await this.get(`/sessions/${encodeURIComponent(sessionId)}/claims`);
     const claims = Array.isArray(data?.claims) ? data.claims : [];
     if (claims.length > 0) {
+      const count = Number(data.claim_count ?? data.count ?? data.total ?? claims.length);
       return {
         ...data,
         claims: claims.map((claim, index) => {
@@ -22175,7 +22651,9 @@ var WebhoundApiClient = class {
             claim_id: claim.claim_id || `${sessionId}:${claim.document_id || "session"}:${traceId}`,
             session_id: sessionId
           };
-        })
+        }),
+        claim_count: Number.isFinite(count) ? count : claims.length,
+        total: Number.isFinite(count) ? count : claims.length
       };
     }
     const full = await this.getSession(sessionId);
@@ -22184,6 +22662,7 @@ var WebhoundApiClient = class {
     return {
       ...data,
       claims: cellClaims,
+      claim_count: cellClaims.length,
       total: cellClaims.length,
       provenance_level: "dataset_cell"
     };
@@ -22191,7 +22670,14 @@ var WebhoundApiClient = class {
   async getSources(sessionId) {
     const data = await this.get(`/sessions/${encodeURIComponent(sessionId)}/sources`);
     const sources = Array.isArray(data?.sources) ? data.sources : [];
-    if (sources.length > 0) return data;
+    if (sources.length > 0) {
+      const count = Number(data.source_count ?? data.count ?? data.total ?? sources.length);
+      return {
+        ...data,
+        source_count: Number.isFinite(count) ? count : sources.length,
+        total: Number.isFinite(count) ? count : sources.length
+      };
+    }
     const full = await this.getSession(sessionId);
     if (sessionKind(full) !== "dataset") return data;
     const counts = /* @__PURE__ */ new Map();
@@ -22208,6 +22694,7 @@ var WebhoundApiClient = class {
     return {
       ...data,
       sources: aggregated,
+      source_count: aggregated.length,
       total: aggregated.length,
       provenance_level: "dataset_cell"
     };
@@ -22284,14 +22771,19 @@ var WebhoundApiClient = class {
     const fileName = requestedFileName || safeUploadFilename("webhound-input", mimeType);
     assertMimeMatchesBytes(bytes, mimeType);
     form.append("file", new Blob([bytes], { type: mimeType }), fileName);
-    return this.request("POST", "/files/upload", form);
+    const data = await this.request("POST", "/files/upload", form);
+    return {
+      ...data,
+      file_name: data.file_name || data.filename || fileName,
+      size_bytes: Number(data.size_bytes ?? data.size ?? bytes.length)
+    };
   }
 };
 
 // core/server.mjs
-var VERSION = "0.5.0";
+var VERSION = "0.5.1";
 var BILLING_URL = "https://www.webhound.ai/billing";
-var MCP_RESOURCE_METADATA_URL = process.env.WEBHOUND_MCP_RESOURCE_METADATA_URL || "https://api.webhound.ai/.well-known/oauth-protected-resource";
+var MCP_RESOURCE_METADATA_URL = process.env.WEBHOUND_MCP_RESOURCE_METADATA_URL || "https://api.webhound.ai/.well-known/oauth-protected-resource/api/v2/mcp";
 var STRUCTURED_CONTENT_VERSION = "webhound-mcp-0.5";
 var MAX_UPLOAD_BYTES2 = 50 * 1024 * 1024;
 var TOOL_NAMES = Object.freeze([
@@ -22521,10 +23013,12 @@ var COMMON_OUTPUT_FIELDS = Object.freeze({
   current_balance: external_exports.number().optional(),
   auto_recharge_enabled: external_exports.boolean().optional(),
   api_message: external_exports.unknown().optional(),
-  data: external_exports.unknown().optional()
+  data: external_exports.unknown().optional(),
+  body: external_exports.record(external_exports.string(), external_exports.unknown()).nullable().optional()
 });
 var FLEX_OBJECT = external_exports.record(external_exports.string(), external_exports.unknown());
 var FLEX_ARRAY = external_exports.array(external_exports.unknown());
+var SESSION_DOCUMENTS = external_exports.union([FLEX_ARRAY, FLEX_OBJECT]);
 var SESSION_OUTPUT_FIELDS = Object.freeze({
   session_id: external_exports.string().optional(),
   product: external_exports.string().optional(),
@@ -22588,8 +23082,8 @@ var TOOL_OUTPUT_SCHEMAS = Object.freeze({
     errors: FLEX_ARRAY.optional(),
     health: FLEX_OBJECT.nullable().optional(),
     credits: external_exports.unknown().optional(),
-    defaults: FLEX_OBJECT.optional(),
-    free_run: FLEX_OBJECT.optional(),
+    defaults: FLEX_OBJECT.nullable().optional(),
+    free_run: FLEX_OBJECT.nullable().optional(),
     account: FLEX_OBJECT.optional(),
     mcp: FLEX_OBJECT.optional()
   }),
@@ -22636,13 +23130,19 @@ var TOOL_OUTPUT_SCHEMAS = Object.freeze({
     default_budget_usd: external_exports.number().optional(),
     default_product: external_exports.string().optional(),
     use_free_run_when_available: external_exports.boolean().optional(),
-    research_harness: external_exports.string().optional()
+    research_harness: external_exports.string().optional(),
+    agent_rules: FLEX_OBJECT.optional(),
+    updated_at: external_exports.string().optional(),
+    source: external_exports.string().optional()
   }),
   webhound_set_defaults: toolOutputSchema("webhound_set_defaults", {
     default_budget_usd: external_exports.number().optional(),
     default_product: external_exports.string().optional(),
     use_free_run_when_available: external_exports.boolean().optional(),
-    research_harness: external_exports.string().optional()
+    research_harness: external_exports.string().optional(),
+    agent_rules: FLEX_OBJECT.optional(),
+    updated_at: external_exports.string().optional(),
+    source: external_exports.string().optional()
   }),
   webhound_start_report: toolOutputSchema("webhound_start_report", {
     ...SESSION_OUTPUT_FIELDS
@@ -22670,7 +23170,7 @@ var TOOL_OUTPUT_SCHEMAS = Object.freeze({
     saved: FLEX_ARRAY.optional(),
     skipped: FLEX_ARRAY.optional(),
     note: external_exports.string().optional(),
-    status: external_exports.string().optional(),
+    status: external_exports.union([external_exports.number().int(), external_exports.string()]).nullable().optional(),
     no_spend: external_exports.boolean().optional(),
     interrupting: external_exports.boolean().optional()
   }),
@@ -22692,7 +23192,10 @@ var TOOL_OUTPUT_SCHEMAS = Object.freeze({
     ...SESSION_OUTPUT_FIELDS,
     reason: external_exports.string().optional(),
     resumes_session: external_exports.boolean().optional(),
-    interrupting: external_exports.boolean().optional()
+    interrupting: external_exports.boolean().optional(),
+    created_at: external_exports.string().optional(),
+    queued: external_exports.boolean().optional(),
+    note: external_exports.string().optional()
   }),
   webhound_stop: toolOutputSchema("webhound_stop", {
     ...SESSION_OUTPUT_FIELDS
@@ -22708,6 +23211,10 @@ var TOOL_OUTPUT_SCHEMAS = Object.freeze({
   webhound_set_budget: toolOutputSchema("webhound_set_budget", {
     ...SESSION_OUTPUT_FIELDS,
     target_budget: external_exports.number().optional(),
+    requested_target_budget: external_exports.number().optional(),
+    minimum_target_budget: external_exports.number().optional(),
+    adjusted_to_cover_current_spend: external_exports.boolean().optional(),
+    resumed_for_assembly: external_exports.boolean().optional(),
     completion_contract: external_exports.string().optional()
   }),
   webhound_get_output: toolOutputSchema("webhound_get_output", {
@@ -22720,10 +23227,19 @@ var TOOL_OUTPUT_SCHEMAS = Object.freeze({
     rows: FLEX_ARRAY.optional(),
     total_rows: external_exports.number().int().optional(),
     schema: FLEX_OBJECT.optional(),
-    documents: FLEX_ARRAY.optional(),
+    documents: SESSION_DOCUMENTS.optional(),
     document_id: external_exports.string().optional(),
     document_state: external_exports.string().optional(),
     selection_key: external_exports.string().optional(),
+    doc_name: external_exports.string().optional(),
+    doc_type: external_exports.string().nullable().optional(),
+    is_output: external_exports.boolean().optional(),
+    total_lines: external_exports.number().int().optional(),
+    showing: FLEX_OBJECT.optional(),
+    sources: FLEX_ARRAY.optional(),
+    available_documents: FLEX_ARRAY.optional(),
+    page: external_exports.number().int().optional(),
+    page_size: external_exports.number().int().optional(),
     truncated: external_exports.boolean().optional(),
     omitted: external_exports.array(external_exports.string()).optional(),
     output_deferred_until_done: external_exports.boolean().optional(),
@@ -22744,6 +23260,9 @@ var TOOL_OUTPUT_SCHEMAS = Object.freeze({
     download_url: external_exports.string().optional(),
     download_note: external_exports.string().optional(),
     binary_download_url: external_exports.string().optional(),
+    document_count: external_exports.number().int().optional(),
+    row_count: external_exports.number().int().optional(),
+    supported_formats: external_exports.array(external_exports.string()).optional(),
     content_truncated: external_exports.boolean().optional(),
     omitted: external_exports.array(external_exports.string()).optional(),
     export_deferred_until_done: external_exports.boolean().optional(),
@@ -22758,7 +23277,7 @@ var TOOL_OUTPUT_SCHEMAS = Object.freeze({
     omitted: external_exports.array(external_exports.string()).optional(),
     session: FLEX_OBJECT.optional(),
     metadata: FLEX_OBJECT.optional(),
-    documents: FLEX_ARRAY.optional(),
+    documents: SESSION_DOCUMENTS.optional(),
     working_docs: FLEX_ARRAY.optional(),
     output: external_exports.unknown().optional(),
     content_markdown: external_exports.string().optional(),
@@ -22780,6 +23299,7 @@ var TOOL_OUTPUT_SCHEMAS = Object.freeze({
     content_hash: external_exports.string().optional(),
     exports: FLEX_OBJECT.optional(),
     excluded_by_request: external_exports.array(external_exports.string()).optional(),
+    generated_at: external_exports.string().optional(),
     requested_kind: external_exports.string().optional(),
     actual_kind: external_exports.string().nullable().optional(),
     artifact: FLEX_OBJECT.optional(),
@@ -22797,6 +23317,9 @@ var TOOL_OUTPUT_SCHEMAS = Object.freeze({
     noindex: external_exports.boolean().optional(),
     publication_id: external_exports.string().nullable().optional(),
     publication_url: external_exports.string().nullable().optional(),
+    title: external_exports.string().optional(),
+    route: external_exports.string().optional(),
+    message: external_exports.string().optional(),
     no_spend: external_exports.boolean().optional(),
     share_only: external_exports.boolean().optional(),
     public_to_anyone_with_link: external_exports.boolean().optional(),
@@ -22806,14 +23329,17 @@ var TOOL_OUTPUT_SCHEMAS = Object.freeze({
     session_id: external_exports.string().optional(),
     claims: FLEX_ARRAY.optional(),
     claim_count: external_exports.number().int().optional(),
+    count: external_exports.number().int().optional(),
     total: external_exports.number().int().optional(),
     provenance_level: external_exports.string().optional(),
+    claim_type: external_exports.string().optional(),
     sources: FLEX_ARRAY.optional()
   }),
   webhound_get_sources: toolOutputSchema("webhound_get_sources", {
     session_id: external_exports.string().optional(),
     sources: FLEX_ARRAY.optional(),
     source_count: external_exports.number().int().optional(),
+    count: external_exports.number().int().optional(),
     total: external_exports.number().int().optional(),
     provenance_level: external_exports.string().optional(),
     claims: FLEX_ARRAY.optional()
@@ -22823,7 +23349,8 @@ var TOOL_OUTPUT_SCHEMAS = Object.freeze({
     sessions: FLEX_ARRAY.optional(),
     results: FLEX_ARRAY.optional(),
     count: external_exports.number().int().optional(),
-    total: external_exports.number().int().optional()
+    total: external_exports.number().int().optional(),
+    active_exact_matches_added: external_exports.number().int().optional()
   }),
   webhound_list_sessions: toolOutputSchema("webhound_list_sessions", {
     sessions: FLEX_ARRAY.optional(),
@@ -22831,7 +23358,10 @@ var TOOL_OUTPUT_SCHEMAS = Object.freeze({
     total: external_exports.number().int().optional(),
     page: external_exports.number().int().optional(),
     limit: external_exports.number().int().optional(),
-    has_more: external_exports.boolean().optional()
+    has_more: external_exports.boolean().optional(),
+    page_size: external_exports.number().int().optional(),
+    total_pages: external_exports.number().int().optional(),
+    total_count: external_exports.number().int().optional()
   }),
   webhound_get_session: toolOutputSchema("webhound_get_session", {
     ...SESSION_OUTPUT_FIELDS,
@@ -22857,14 +23387,18 @@ var TOOL_OUTPUT_SCHEMAS = Object.freeze({
     artifacts: FLEX_OBJECT.optional(),
     session_revision: external_exports.union([external_exports.string(), external_exports.number()]).optional(),
     content_hash: external_exports.string().optional(),
-    content_markdown: external_exports.string().optional()
+    content_markdown: external_exports.string().optional(),
+    generated_at: external_exports.string().optional()
   }),
   webhound_upload_file: toolOutputSchema("webhound_upload_file", {
     file_id: external_exports.string().optional(),
     id: external_exports.string().optional(),
     file_name: external_exports.string().optional(),
+    filename: external_exports.string().optional(),
     mime_type: external_exports.string().optional(),
     size_bytes: external_exports.number().int().optional(),
+    size: external_exports.number().int().optional(),
+    extraction_status: external_exports.string().optional(),
     files: FLEX_ARRAY.optional(),
     file_ids: external_exports.array(external_exports.string()).optional()
   }),
@@ -22872,8 +23406,8 @@ var TOOL_OUTPUT_SCHEMAS = Object.freeze({
     authenticated: external_exports.boolean().optional(),
     credits: external_exports.unknown().optional(),
     usage: FLEX_OBJECT.optional(),
-    free_run: FLEX_OBJECT.optional(),
-    defaults: FLEX_OBJECT.optional(),
+    free_run: FLEX_OBJECT.nullable().optional(),
+    defaults: FLEX_OBJECT.nullable().optional(),
     billing: FLEX_OBJECT.optional(),
     research_harness: external_exports.string().optional(),
     can_start_default_paid_run: external_exports.boolean().optional(),
@@ -22883,6 +23417,83 @@ var TOOL_OUTPUT_SCHEMAS = Object.freeze({
     ...SESSION_OUTPUT_FIELDS
   })
 });
+function isRecord(value) {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+function hasOwn(value, key) {
+  return isRecord(value) && Object.hasOwn(value, key);
+}
+function hasText(value) {
+  return typeof value === "string" && value.trim().length > 0;
+}
+function hasFiniteNumber(value) {
+  return value !== null && value !== void 0 && value !== "" && Number.isFinite(Number(value));
+}
+function hasCollection(data, keys) {
+  return keys.some((key) => Array.isArray(data?.[key]));
+}
+function hasSessionSnapshot(data) {
+  return hasText(data?.session_id) && hasText(String(data?.status ?? "")) && typeof data?.done === "boolean" && typeof data?.output_ready === "boolean";
+}
+function validPublicUrl(value) {
+  if (!hasText(value)) return false;
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:" || url.protocol === "http:";
+  } catch {
+    return false;
+  }
+}
+var TOOL_SUCCESS_CONTRACTS = Object.freeze({
+  webhound_health: (data) => typeof data.mcp_ready === "boolean" && typeof data.api_reachable === "boolean" && typeof data.authenticated === "boolean" && isRecord(data.services) && Array.isArray(data.errors) ? null : "health readiness, reachability, authentication, services, or errors are missing",
+  webhound_onboarding: (data) => hasText(data.flow_id) && data.flow_version === 1 && hasText(data.message) && Array.isArray(data.choices) && hasText(data.next_action) && isRecord(data.account_state) ? null : "the onboarding state-machine response is incomplete",
+  webhound_help: (data) => hasText(data.topic) && hasText(data.answer) && data.no_spend === true && Array.isArray(data.related_tools) ? null : "help topic, answer, no-spend marker, or related tools are missing",
+  webhound_uninstall: (data) => hasText(data.client) && Array.isArray(data.steps) && data.steps.length > 0 && data.no_spend === true && data.guidance_only === true ? null : "uninstall guidance is incomplete",
+  webhound_get_defaults: (data) => hasFiniteNumber(data.default_budget_usd) && hasText(data.default_product) && typeof data.use_free_run_when_available === "boolean" && hasText(data.research_harness) ? null : "saved MCP defaults are incomplete",
+  webhound_set_defaults: (data) => hasFiniteNumber(data.default_budget_usd) && hasText(data.default_product) && typeof data.use_free_run_when_available === "boolean" && hasText(data.research_harness) ? null : "the updated MCP defaults were not confirmed",
+  webhound_start_report: (data) => hasText(data.session_id) ? null : "the start response did not confirm a report session ID",
+  webhound_start_dataset: (data) => hasText(data.session_id) ? null : "the start response did not confirm a dataset session ID",
+  webhound_watch: (data) => hasSessionSnapshot(data) ? null : "the watch response is missing its canonical session snapshot",
+  webhound_wait: (data) => hasSessionSnapshot(data) && isRecord(data.polling) ? null : "the wait response is missing its canonical session snapshot or polling state",
+  webhound_add_sidecar_notes: (data) => hasText(data.session_id) && Number.isInteger(data.count) && data.count >= 0 && hasCollection(data, ["notes", "saved", "skipped"]) ? null : "the sidecar-note write was not confirmed",
+  webhound_list_sidecar_notes: (data) => hasText(data.session_id) && Number.isInteger(data.count) && data.count >= 0 && Array.isArray(data.notes) ? null : "the sidecar-note list response is incomplete",
+  webhound_update_sidecar_note: (data) => hasText(data.session_id) && data.updated === true && isRecord(data.note) ? null : "the sidecar-note update was not confirmed",
+  webhound_send_message: (data) => hasText(data.session_id) && (hasText(data.message_id) || hasText(data.status) || hasText(data.message) || hasText(data.created_at) || typeof data.queued === "boolean" || data.accepted === true || data.resumed === true) ? null : "the guidance message or resume was not confirmed",
+  webhound_stop: (data) => hasText(data.session_id) && (hasText(data.status) || hasText(data.message) || data.stopped === true) ? null : "the stop request was not confirmed",
+  webhound_resume: (data) => hasText(data.session_id) && (hasText(data.status) || hasText(data.message) || data.resumed === true) ? null : "the resume request was not confirmed",
+  webhound_add_budget: (data) => hasText(data.session_id) && [
+    data.amount,
+    data.amount_added,
+    data.current_budget,
+    data.new_budget,
+    data.budget
+  ].some(hasFiniteNumber) ? null : "the budget addition was not confirmed",
+  webhound_set_budget: (data) => hasText(data.session_id) && [data.target_budget, data.current_budget, data.new_budget].some(hasFiniteNumber) ? null : "the new report budget was not confirmed",
+  webhound_get_output: (data) => data.output_deferred_until_done === true ? hasSessionSnapshot(data) ? null : "the deferred output response is missing its session snapshot" : typeof data.complete_output === "boolean" && hasText(data.actual_kind) && isRecord(data.artifact) && typeof data.artifact.known === "boolean" ? null : "the output response is missing its artifact state",
+  webhound_export_session: (data) => data.export_deferred_until_done === true ? hasSessionSnapshot(data) ? null : "the deferred export response is missing its session snapshot" : typeof data.complete_export === "boolean" && hasText(data.delivery) && hasText(data.filename) && hasText(data.mime_type) && hasFiniteNumber(data.size_bytes) ? null : "the export response is missing delivery or artifact metadata",
+  webhound_get_evidence_pack: (data) => data.evidence_pack_deferred_until_done === true ? hasSessionSnapshot(data) ? null : "the deferred evidence response is missing its session snapshot" : hasText(data.session_id) && Array.isArray(data.documents) && typeof data.complete_evidence_pack === "boolean" && typeof data.complete_session === "boolean" && isRecord(data.artifact) && typeof data.artifact.known === "boolean" ? null : "the evidence pack is missing its canonical documents or artifact state",
+  webhound_get_shareable_link: (data) => hasText(data.session_id) && validPublicUrl(data.share_url || data.public_url) ? null : "the share-link mutation did not return a valid public URL",
+  webhound_get_claims: (data) => hasText(data.session_id) && Array.isArray(data.claims) ? null : "the claim response is missing its session identity or claim collection",
+  webhound_get_sources: (data) => hasText(data.session_id) && Array.isArray(data.sources) ? null : "the source response is missing its session identity or source collection",
+  webhound_search_sessions: (data) => hasCollection(data, ["sessions", "results", "data"]) ? null : "the search response is missing its result collection",
+  webhound_list_sessions: (data) => hasCollection(data, ["sessions", "results", "data"]) ? null : "the session-list response is missing its session collection",
+  webhound_get_session: (data) => hasText(data.session_id) && Array.isArray(data.documents) && isRecord(data.evidence) ? null : "the canonical full-session response is incomplete",
+  webhound_upload_file: (data) => {
+    if (Array.isArray(data.files)) {
+      return data.files.length > 0 && data.files.every((file) => isRecord(file) && hasText(file.file_id || file.id)) && Array.isArray(data.file_ids) && data.file_ids.length === data.files.length ? null : "one or more uploaded files are missing a confirmed file ID";
+    }
+    return hasText(data.file_id || data.id) ? null : "the upload response did not confirm a file ID";
+  },
+  webhound_account: (data) => hasOwn(data, "credits") && isRecord(data.usage) ? null : "the account response is missing credits or usage",
+  webhound_diagnose: (data) => hasSessionSnapshot(data) ? null : "the diagnostic response is missing its canonical session snapshot"
+});
+if (Object.keys(TOOL_SUCCESS_CONTRACTS).length !== TOOL_NAMES.length || TOOL_NAMES.some((name) => typeof TOOL_SUCCESS_CONTRACTS[name] !== "function")) {
+  throw new Error("Every Webhound MCP tool must define a semantic success contract.");
+}
+function toolSuccessContractIssue(name, data = {}) {
+  const validate = TOOL_SUCCESS_CONTRACTS[name];
+  return typeof validate === "function" ? validate(data) : `no semantic success contract is registered for ${name}`;
+}
 var CHATGPT_FILE_SCHEMA = external_exports.object({
   download_url: external_exports.string().url().refine((value) => value.startsWith("https://"), "Attachment download_url must use HTTPS."),
   file_id: external_exports.string(),
@@ -22890,24 +23501,30 @@ var CHATGPT_FILE_SCHEMA = external_exports.object({
   file_name: external_exports.string().optional()
 }).passthrough();
 var DATASET_ATTRIBUTE_SCHEMA = external_exports.object({
-  name: external_exports.string().min(1).max(120),
-  description: external_exports.string().max(1e3).optional(),
-  type: external_exports.enum(["string", "number", "integer", "boolean", "object"]).default("string"),
+  name: external_exports.string().min(1).max(128),
+  description: external_exports.string().max(2e3).optional(),
+  type: external_exports.string().max(40).default("string"),
   is_array: external_exports.boolean().default(false),
   is_primary: external_exports.boolean().default(false),
-  standard_format: external_exports.string().max(120).optional()
-}).strict();
+  required: external_exports.boolean().optional(),
+  standard_format: external_exports.string().max(500).optional(),
+  format: external_exports.string().max(120).optional(),
+  item_type: external_exports.string().max(40).optional(),
+  items: external_exports.object({
+    type: external_exports.string().max(40).optional()
+  }).passthrough().optional()
+}).passthrough();
 var NATIVE_DATASET_SCHEMA = external_exports.object({
-  entity_name: external_exports.string().min(1).max(200).optional(),
-  entity_description: external_exports.string().max(2e3).optional(),
-  entity_criteria: external_exports.array(external_exports.string().max(500)).max(30).optional(),
+  entity_name: external_exports.string().min(1).max(160).optional(),
+  entity_description: external_exports.string().max(4e3).optional(),
+  entity_criteria: external_exports.array(external_exports.string().min(1)).optional(),
   entity: external_exports.object({
-    name: external_exports.string().min(1).max(200).optional(),
-    description: external_exports.string().max(2e3).optional(),
-    criteria: external_exports.array(external_exports.string().max(500)).max(30).optional()
-  }).strict().optional(),
+    name: external_exports.string().min(1).max(160).optional(),
+    description: external_exports.string().max(4e3).optional(),
+    criteria: external_exports.array(external_exports.string().min(1)).optional()
+  }).passthrough().optional(),
   attributes: external_exports.array(DATASET_ATTRIBUTE_SCHEMA).min(1).max(200)
-}).strict().superRefine((schema, context) => {
+}).passthrough().superRefine((schema, context) => {
   const names = schema.attributes.map((attribute) => attribute.name);
   if (new Set(names).size !== names.length) {
     context.addIssue({ code: external_exports.ZodIssueCode.custom, message: "Dataset attribute names must be unique.", path: ["attributes"] });
@@ -22921,18 +23538,28 @@ var JSON_SCHEMA_PROPERTY = external_exports.object({
     external_exports.enum(["string", "number", "integer", "boolean", "object", "array"]),
     external_exports.array(external_exports.enum(["string", "number", "integer", "boolean", "object", "array", "null"])).min(1)
   ]).optional(),
-  description: external_exports.string().max(1e3).optional(),
+  description: external_exports.string().max(2e3).optional(),
+  title: external_exports.string().max(2e3).optional(),
   format: external_exports.string().max(120).optional(),
-  items: external_exports.object({ type: external_exports.enum(["string", "number", "integer", "boolean", "object"]).optional() }).passthrough().optional(),
+  items: external_exports.object({
+    type: external_exports.union([
+      external_exports.enum(["string", "number", "integer", "boolean", "object", "array"]),
+      external_exports.array(external_exports.enum(["string", "number", "integer", "boolean", "object", "array", "null"])).min(1)
+    ]).optional()
+  }).passthrough().optional(),
   "x-webhound-primary": external_exports.boolean().optional(),
   "x-primary-key": external_exports.boolean().optional()
 }).passthrough();
 var JSON_DATASET_SCHEMA = external_exports.object({
   type: external_exports.literal("object"),
-  title: external_exports.string().min(1).max(200).optional(),
-  description: external_exports.string().max(2e3).optional(),
+  title: external_exports.string().min(1).max(160).optional(),
+  description: external_exports.string().max(4e3).optional(),
   properties: external_exports.record(JSON_SCHEMA_PROPERTY).refine((value) => Object.keys(value).length > 0, "JSON Schema properties cannot be empty.").refine((value) => Object.keys(value).length <= 200, "JSON Schema properties support at most 200 fields."),
-  required: external_exports.array(external_exports.string()).optional()
+  required: external_exports.array(external_exports.string()).optional(),
+  "x-webhound-primary-key": external_exports.union([
+    external_exports.string(),
+    external_exports.array(external_exports.string())
+  ]).optional()
 }).passthrough();
 var DATASET_SCHEMA_INPUT = external_exports.union([NATIVE_DATASET_SCHEMA, JSON_DATASET_SCHEMA]);
 var ONBOARDING_CLIENTS = ["hosted", "manus", "codex", "claude_code", "cursor", "claude_desktop", "generic"];
@@ -22964,6 +23591,29 @@ function isTrustedAttachmentHost(hostname2) {
   const host = String(hostname2 || "").toLowerCase().replace(/\.$/, "");
   return configuredAttachmentHosts().some((allowed) => host === allowed || host.endsWith(`.${allowed}`));
 }
+function parseIpv6Words(address) {
+  let value = String(address || "").toLowerCase().split("%", 1)[0];
+  if (!value || isIP(value) !== 6) return null;
+  if (value.includes(".")) {
+    const lastColon = value.lastIndexOf(":");
+    const ipv42 = value.slice(lastColon + 1).split(".").map(Number);
+    if (ipv42.length !== 4 || ipv42.some((part) => !Number.isInteger(part) || part < 0 || part > 255)) return null;
+    value = `${value.slice(0, lastColon)}:${(ipv42[0] << 8 | ipv42[1]).toString(16)}:${(ipv42[2] << 8 | ipv42[3]).toString(16)}`;
+  }
+  const halves = value.split("::");
+  if (halves.length > 2) return null;
+  const left = halves[0] ? halves[0].split(":") : [];
+  const right = halves.length === 2 && halves[1] ? halves[1].split(":") : [];
+  const missing = halves.length === 2 ? 8 - left.length - right.length : 0;
+  if (halves.length === 1 && left.length !== 8) return null;
+  if (halves.length === 2 && missing < 1) return null;
+  const groups = [...left, ...Array(missing).fill("0"), ...right];
+  if (groups.length !== 8 || groups.some((group) => !/^[0-9a-f]{1,4}$/.test(group))) return null;
+  return groups.map((group) => Number.parseInt(group, 16));
+}
+function embeddedIpv4(words, start = 6) {
+  return `${words[start] >> 8}.${words[start] & 255}.${words[start + 1] >> 8}.${words[start + 1] & 255}`;
+}
 function isBlockedAddress(address) {
   if (!address) return true;
   if (address.startsWith("::ffff:")) return isBlockedAddress(address.slice(7));
@@ -22973,12 +23623,57 @@ function isBlockedAddress(address) {
     return a === 0 || a === 10 || a === 127 || a === 100 && b >= 64 && b <= 127 || a === 169 && b === 254 || a === 172 && b >= 16 && b <= 31 || a === 192 && (b === 0 || b === 168) || a === 198 && (b === 18 || b === 19 || b === 51) || a === 203 && b === 0 || a >= 224;
   }
   if (isIP(address) === 6) {
-    const normalized = address.toLowerCase();
-    return normalized === "::" || normalized === "::1" || normalized.startsWith("fc") || normalized.startsWith("fd") || /^fe[89ab]/.test(normalized) || normalized.startsWith("ff") || normalized.startsWith("2001:db8:");
+    const words = parseIpv6Words(address);
+    if (!words) return true;
+    const allZeroPrefix = words.slice(0, 6).every((word) => word === 0);
+    if (words.every((word) => word === 0)) return true;
+    if (words.slice(0, 7).every((word) => word === 0) && words[7] === 1) return true;
+    if (allZeroPrefix || words.slice(0, 5).every((word) => word === 0) && words[5] === 65535) {
+      return isBlockedAddress(embeddedIpv4(words));
+    }
+    if ((words[0] & 65024) === 64512) return true;
+    if ((words[0] & 65472) === 65152) return true;
+    if ((words[0] & 65280) === 65280) return true;
+    if (words[0] === 256 && words.slice(1, 4).every((word) => word === 0)) return true;
+    if (words[0] === 8193 && words[1] === 3512) return true;
+    if (words[0] === 8193 && [0, 2, 16, 32].includes(words[1])) return true;
+    if (words[0] === 100 && words[1] === 65435) {
+      if (words[2] === 1) return true;
+      if (words.slice(2, 6).every((word) => word === 0)) return isBlockedAddress(embeddedIpv4(words));
+    }
+    if (words[0] === 8194) {
+      const embedded = `${words[1] >> 8}.${words[1] & 255}.${words[2] >> 8}.${words[2] & 255}`;
+      if (isBlockedAddress(embedded)) return true;
+    }
+    return (words[0] & 57344) !== 8192;
   }
   return true;
 }
-async function validateRemoteAttachmentUrl(value) {
+function remainingAttachmentTime(deadline, fileId) {
+  const remaining = Number(deadline) - Date.now();
+  if (!Number.isFinite(remaining) || remaining <= 0) throw attachmentTimeoutError(fileId);
+  return remaining;
+}
+async function beforeAttachmentDeadline(promise, deadline, fileId) {
+  if (!deadline) return promise;
+  const remaining = remainingAttachmentTime(deadline, fileId);
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(attachmentTimeoutError(fileId)), remaining);
+      })
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+async function resolveRemoteAttachmentUrl(value, {
+  lookupFn = lookup,
+  deadline = null,
+  fileId = "attachment"
+} = {}) {
   let url;
   try {
     url = new URL(value);
@@ -23000,7 +23695,12 @@ async function validateRemoteAttachmentUrl(value) {
       nextAction: "Use an attachment URL supplied by the current MCP client, or upload local/text/base64 content through stdio."
     });
   }
-  const addresses = await lookup(url.hostname, { all: true, verbatim: true }).catch((error2) => {
+  const addresses = await beforeAttachmentDeadline(
+    Promise.resolve().then(() => lookupFn(url.hostname, { all: true, verbatim: true })),
+    deadline,
+    fileId
+  ).catch((error2) => {
+    if (error2?.code === "ATTACHMENT_TIMEOUT") throw error2;
     throw webhoundError(`Could not resolve attachment host "${url.hostname}": ${error2.message}`, {
       code: "ATTACHMENT_DNS_ERROR",
       status: 400,
@@ -23014,85 +23714,174 @@ async function validateRemoteAttachmentUrl(value) {
       retryable: false
     });
   }
-  return url;
+  return {
+    url,
+    addresses: addresses.map((item) => ({
+      address: item.address,
+      family: Number(item.family) || isIP(item.address)
+    }))
+  };
 }
-async function downloadRemoteAttachment(value, fileId) {
-  let current = await validateRemoteAttachmentUrl(value);
+function attachmentTimeoutError(fileId) {
+  const error2 = new Error(`Attachment ${fileId} timed out.`);
+  error2.code = "ATTACHMENT_TIMEOUT";
+  return error2;
+}
+function requestResolvedAttachment(resolved, fileId, {
+  requestFn = httpsRequest,
+  timeoutMs = 2e4,
+  inactivityTimeoutMs = timeoutMs,
+  deadline = Date.now() + timeoutMs
+} = {}) {
+  return new Promise((resolve, reject) => {
+    const remaining = remainingAttachmentTime(deadline, fileId);
+    let settled = false;
+    let timer;
+    let abortError = null;
+    let request;
+    const finish = () => {
+      if (timer) clearTimeout(timer);
+      timer = null;
+    };
+    const abortForTimeout = () => {
+      if (!abortError) abortError = attachmentTimeoutError(fileId);
+      request?.destroy(abortError);
+    };
+    const lookupPinned = (_hostname, options, callback) => {
+      if (typeof options === "function") {
+        callback = options;
+        options = {};
+      }
+      if (options?.all) {
+        callback(null, resolved.addresses.map((item) => ({
+          address: item.address,
+          family: item.family
+        })));
+        return;
+      }
+      const selected = resolved.addresses[0];
+      callback(null, selected.address, selected.family);
+    };
+    request = requestFn(resolved.url, {
+      method: "GET",
+      lookup: lookupPinned,
+      servername: resolved.url.hostname,
+      headers: { Accept: "*/*" }
+    }, (response) => {
+      settled = true;
+      resolve({ request, response, finish, getAbortError: () => abortError });
+    });
+    request.once("error", (error2) => {
+      finish();
+      if (!settled) reject(error2);
+    });
+    const inactivity = Math.max(1, Math.min(Number(inactivityTimeoutMs) || timeoutMs, remaining));
+    request.setTimeout(inactivity, abortForTimeout);
+    timer = setTimeout(abortForTimeout, remaining);
+    request.end();
+  });
+}
+function attachmentDownloadError(error2, fileId) {
+  return webhoundError(`Could not download attachment ${fileId}: ${error2.message}`, {
+    code: error2?.code === "ATTACHMENT_TIMEOUT" ? "ATTACHMENT_TIMEOUT" : "ATTACHMENT_DOWNLOAD_FAILED",
+    status: error2?.code === "ATTACHMENT_TIMEOUT" ? 408 : 502,
+    retryable: true
+  });
+}
+async function downloadRemoteAttachment(value, fileId, options = {}) {
+  const maxBytes = Number(options.maxBytes || MAX_UPLOAD_BYTES2);
+  const timeoutMs = Math.max(1, Number(options.timeoutMs) || 2e4);
+  const deadline = Number(options.deadline) || Date.now() + timeoutMs;
+  const requestOptions = { ...options, timeoutMs, deadline, fileId };
+  let resolved;
+  try {
+    resolved = await resolveRemoteAttachmentUrl(value, requestOptions);
+  } catch (error2) {
+    if (error2?.code === "ATTACHMENT_TIMEOUT") throw attachmentDownloadError(error2, fileId);
+    throw error2;
+  }
   for (let redirects = 0; redirects <= 3; redirects += 1) {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 2e4);
-    let response;
+    let active;
     try {
-      response = await fetch(current, { redirect: "manual", signal: controller.signal });
+      active = await requestResolvedAttachment(resolved, fileId, requestOptions);
     } catch (error2) {
-      throw webhoundError(`Could not download attachment ${fileId}: ${error2.message}`, {
-        code: error2?.name === "AbortError" ? "ATTACHMENT_TIMEOUT" : "ATTACHMENT_DOWNLOAD_FAILED",
-        status: error2?.name === "AbortError" ? 408 : 502,
-        retryable: true
-      });
-    } finally {
-      clearTimeout(timeout);
+      throw attachmentDownloadError(error2, fileId);
     }
-    if ([301, 302, 303, 307, 308].includes(response.status)) {
-      const location = response.headers.get("location");
-      if (!location || redirects === 3) {
-        throw webhoundError(`Attachment ${fileId} exceeded the redirect limit.`, {
-          code: "ATTACHMENT_REDIRECT_REJECTED",
-          status: 400,
-          retryable: false
+    const { response, request, finish, getAbortError } = active;
+    try {
+      const status = Number(response.statusCode || 0);
+      if ([301, 302, 303, 307, 308].includes(status)) {
+        const location = response.headers.location;
+        response.resume();
+        if (!location || redirects === 3) {
+          throw webhoundError(`Attachment ${fileId} exceeded the redirect limit.`, {
+            code: "ATTACHMENT_REDIRECT_REJECTED",
+            status: 400,
+            retryable: false
+          });
+        }
+        try {
+          resolved = await resolveRemoteAttachmentUrl(
+            new URL(location, resolved.url).href,
+            requestOptions
+          );
+        } catch (error2) {
+          if (error2?.code === "ATTACHMENT_TIMEOUT") throw attachmentDownloadError(error2, fileId);
+          throw error2;
+        }
+        continue;
+      }
+      if (status < 200 || status >= 300) {
+        response.resume();
+        throw webhoundError(`Could not download attachment ${fileId}: HTTP ${status}.`, {
+          code: "ATTACHMENT_DOWNLOAD_FAILED",
+          status,
+          retryable: status === 429 || status >= 500
         });
       }
-      current = await validateRemoteAttachmentUrl(new URL(location, current).href);
-      continue;
-    }
-    if (!response.ok) {
-      throw webhoundError(`Could not download attachment ${fileId}: HTTP ${response.status}.`, {
-        code: "ATTACHMENT_DOWNLOAD_FAILED",
-        status: response.status,
-        retryable: response.status === 429 || response.status >= 500
-      });
-    }
-    const advertisedLength = Number(response.headers.get("content-length") || 0);
-    if (advertisedLength > MAX_UPLOAD_BYTES2) {
-      throw webhoundError(`Attachment ${fileId} exceeds Webhound's 50 MB upload limit.`, {
-        code: "FILE_TOO_LARGE",
-        status: 413,
-        retryable: false
-      });
-    }
-    const reader = response.body?.getReader();
-    if (!reader) {
-      throw webhoundError(`Attachment ${fileId} returned no readable body.`, {
-        code: "ATTACHMENT_DOWNLOAD_FAILED",
-        status: 502,
-        retryable: true
-      });
-    }
-    const chunks = [];
-    let total = 0;
-    while (true) {
-      const { done, value: chunk } = await reader.read();
-      if (done) break;
-      total += chunk.byteLength;
-      if (total > MAX_UPLOAD_BYTES2) {
-        await reader.cancel().catch(() => {
-        });
+      const advertisedLength = Number(response.headers["content-length"] || 0);
+      if (advertisedLength > maxBytes) {
+        response.destroy();
         throw webhoundError(`Attachment ${fileId} exceeds Webhound's 50 MB upload limit.`, {
           code: "FILE_TOO_LARGE",
           status: 413,
           retryable: false
         });
       }
-      chunks.push(Buffer.from(chunk));
+      const chunks = [];
+      let total = 0;
+      try {
+        for await (const chunk of response) {
+          total += chunk.byteLength;
+          if (total > maxBytes) {
+            response.destroy();
+            throw webhoundError(`Attachment ${fileId} exceeds Webhound's 50 MB upload limit.`, {
+              code: "FILE_TOO_LARGE",
+              status: 413,
+              retryable: false
+            });
+          }
+          chunks.push(Buffer.from(chunk));
+        }
+      } catch (error2) {
+        const timeoutError = getAbortError?.();
+        if (timeoutError || error2?.code === "ATTACHMENT_TIMEOUT") {
+          throw attachmentDownloadError(timeoutError || error2, fileId);
+        }
+        throw error2;
+      }
+      if (total === 0) {
+        throw webhoundError(`Attachment ${fileId} is empty.`, { code: "EMPTY_FILE", status: 400, retryable: false });
+      }
+      return {
+        bytes: Buffer.concat(chunks, total),
+        mimeType: response.headers["content-type"] || void 0,
+        finalUrl: resolved.url.href
+      };
+    } finally {
+      finish();
+      if (!response.complete && !response.destroyed) request.destroy();
     }
-    if (total === 0) {
-      throw webhoundError(`Attachment ${fileId} is empty.`, { code: "EMPTY_FILE", status: 400, retryable: false });
-    }
-    return {
-      bytes: Buffer.concat(chunks, total),
-      mimeType: response.headers.get("content-type") || void 0,
-      finalUrl: current.href
-    };
   }
   throw webhoundError(`Attachment ${fileId} could not be downloaded safely.`, {
     code: "ATTACHMENT_DOWNLOAD_FAILED",
@@ -23134,42 +23923,6 @@ var UNINSTALL_CLIENTS = Object.freeze([
   "manus",
   "hosted_mcp",
   "generic"
-]);
-var WORKSPACE_USE_CASES = Object.freeze([
-  "Fresh/current web research that needs citations",
-  "Competitive, vendor, pricing, or market scans",
-  "Due diligence and source-backed strategic research",
-  "Sourced datasets, lists, directories, or lead/entity extraction",
-  "Fallback when normal web search is too shallow, scattered, or conflicting"
-]);
-var WORKSPACE_BUDGET_POLICY = Object.freeze({
-  default_budget_usd: 5,
-  recommended_mode: "simple_tiers",
-  tiers: [
-    { amount_usd: 2, label: "quick", use: "Quick scouting, narrow questions, or first-pass context." },
-    { amount_usd: 5, label: "standard", use: "Normal cited research, market scans, vendor comparisons, and first-pass datasets." },
-    { amount_usd: 10, label: "deep", use: "High-stakes, broad, ambiguous, or decision-driving research." }
-  ],
-  rule: "Default to $5 unless the user gives another budget. Use $2 for quick scouting, $5 for normal research, and $10 for deeper or more important work. If unclear, suggest a budget briefly before starting."
-});
-var WORKSPACE_RULE_TARGETING = Object.freeze({
-  instruction: "Before writing rules, ask where they should apply. Prefer project-specific rules for the workspace where the user expects to work. If this agent can access multiple projects, propose per-project Webhound rules for each relevant project. If it cannot access the target project, offer a global/user-level rule file or give the exact snippet to paste. Never silently write Webhound rules into a temporary onboarding chat directory.",
-  options: [
-    { id: "current_project", label: "This project/workspace", location: "the client rule file for the current project, such as AGENTS.md, CLAUDE.md, or .cursor/rules/webhound.md" },
-    { id: "specific_project", label: "A specific project", location: "the rule file inside the project the user names, if this agent can access it" },
-    { id: "all_accessible_projects", label: "All accessible projects", location: "project-specific rule files, with rules tailored to each project instead of one generic blob" },
-    { id: "global_agent_rules", label: "Global agent rules", location: "the client/user-level rules file, only when project-specific install is not possible or the user wants global behavior" }
-  ],
-  anti_pattern: "Do not write rules into the current chat workspace just because it is writable. If this is a temporary onboarding chat directory, ask for the real target or use the global/user-level fallback."
-});
-var WORKSPACE_AUDIT_RUBRIC = Object.freeze([
-  "Infer what the user actually does from workspace context without assuming their role: founder/operator, investor, researcher, engineer, seller, recruiter, lawyer, student, analyst, journalist, educator, consultant, or another role.",
-  "Look for recurring work patterns and artifacts: product plans, customer questions, markets, competitors, vendors, people, companies, legal/regulatory topics, fundraising, hiring, job search, APIs/docs, datasets, lead lists, and decisions that need external evidence.",
-  "Suggest Webhound where fresh outside research, source coverage, synthesis, or structured extraction would materially improve the work.",
-  "Include use cases beyond generic market research when they fit: person research, customer/user research, legal or regulatory research, investor/fundraising research, hiring/company research, job-search research, academic/literature research, policy research, procurement, partnership diligence, local/history research, technical docs/API research, lead lists, and sourced datasets.",
-  "Avoid Webhound for local-only coding edits, simple facts, summaries of provided text, or anything where a quick answer is enough.",
-  "Before inspecting or writing, ask where the rules should apply: this project, another accessible project, all accessible projects, or global agent rules. If multiple projects are accessible, suggest per-project rules for each project where Webhound fits. Do not write into a temporary onboarding directory just because it is the current working directory.",
-  "After inspecting the approved target context, present a concise proposal for the places Webhound fits. Include only useful rules; do not force a fixed count. Include a short budget policy, usually $2 quick / $5 standard / $10 deep unless the user prefers one default. Before writing anything, ask whether there are any other situations or budget tiers the user wants to add. Then ask for confirmation, write approved rules to the chosen target, and tell the user the rules apply after restarting the agent or opening a new chat. Then return to watching the Webhound run and tell the user the estimated time remaining from runtime_estimate."
 ]);
 var HELP_GUIDANCE = Object.freeze({
   overview: {
@@ -23274,7 +24027,7 @@ var HELP_GUIDANCE = Object.freeze({
     suggested_user_facing_wording: "I can check the sources and claim traces to see whether the output is well-supported."
   },
   files: {
-    answer: "Agents can upload CSV, XLSX, XLS, PDF, DOCX, DOC, TXT, Markdown, or VTT files for Webhound to use in a report or dataset. Other formats are rejected before upload.",
+    answer: "Agents can upload CSV, XLSX, PDF, DOCX, TXT, Markdown, or VTT files for Webhound to use in a report or dataset. Convert legacy XLS/DOC files to XLSX/DOCX first; other formats are rejected before upload.",
     agent_behavior_rules: [
       "Upload files before starting when the file should shape the run.",
       "Use file_ids when starting or resuming a session.",
@@ -23337,7 +24090,7 @@ var HELP_GUIDANCE = Object.freeze({
   onboarding: {
     answer: "Onboarding is a compact, client-aware first-run flow. It asks one question at a time and moves directly to a report or dataset. Hosted clients never create or edit workspace rules unless the user explicitly requests that separate action.",
     agent_behavior_rules: [
-      "Call webhound_onboarding first and send immediate_next_message rather than summarizing account state.",
+      "Call webhound_onboarding with the current client when known. Send its message once, present its choices, and follow its next_action one step at a time instead of summarizing account state.",
       "Ask one question at a time.",
       "Do not inject workspace-rule setup into start_report or start_dataset responses.",
       "For hosted clients, do not create or edit workspace rules unless the user explicitly asks.",
@@ -23347,10 +24100,10 @@ var HELP_GUIDANCE = Object.freeze({
     ],
     related_tools: ["webhound_onboarding", "webhound_set_defaults", "webhound_start_report", "webhound_start_dataset", "webhound_add_sidecar_notes", "webhound_list_sidecar_notes", "webhound_update_sidecar_note"],
     common_mistakes: ["Dumping JSON to the user.", "Inspecting workspace before asking permission.", "Writing rules into a temporary onboarding chat directory instead of the chosen project/global target.", "Forgetting to tell the user rules apply after restart/new chat."],
-    suggested_user_facing_wording: "I will walk you through the first run, then set up when this agent should use Webhound in the future."
+    suggested_user_facing_wording: "I will walk you through one onboarding step at a time and help you start the right first Webhound run. I will not create or edit workspace rules unless you explicitly ask."
   },
   mcp_setup: {
-    answer: "There are two setup paths. For Codex, Claude Code, Cursor, and agents that can edit MCP config, paste the generated setup prompt; it installs the pinned webhound-mcp@0.5.0 package, configures the user key, verifies webhound_health, and explains whether a restart is needed. For Manus and OAuth-capable hosted apps, add https://api.webhound.ai/api/v2/mcp by URL and complete Webhound sign-in; do not add a bearer header in Manus.",
+    answer: `There are two setup paths. For Codex, Claude Code, Cursor, and agents that can edit MCP config, paste the generated setup prompt; it installs the pinned webhound-mcp@${VERSION} package, configures the user key, verifies webhound_health, and explains whether a restart is needed. For Manus and OAuth-capable hosted apps, add https://api.webhound.ai/api/v2/mcp by URL and complete Webhound sign-in; do not add a bearer header in Manus.`,
     agent_behavior_rules: [
       "After config changes, remind the user that many clients only load MCP tools at session start.",
       "Use webhound_health after tools appear.",
@@ -23664,20 +24417,131 @@ function kindFromSession(value = {}) {
   if (raw === "report" || raw === "research") return "report";
   return null;
 }
+function documentId(document = {}) {
+  const value = document.document_id ?? document.id;
+  return value === void 0 || value === null || String(value).trim() === "" ? null : String(value);
+}
+function documentContent(document = {}) {
+  const value = document.content_markdown ?? document.content;
+  return typeof value === "string" ? value.trim() : "";
+}
+function isArchivedOutputDocument(document = {}) {
+  return document.doc_type === "output_archived" || document.document_role === "archived_output" || document.document_state === "archived";
+}
+function isOutputDocument(document = {}) {
+  return document.document_role === "current_output" || document.document_role === "superseded_output" || document.doc_type === "output" || document.is_output === true;
+}
+function primaryOutputDocumentId(data = {}) {
+  const value = data.primary_output_document_id ?? data.artifacts?.primary_output_document_id ?? data.artifact_links?.primary_output_document_id;
+  return value === void 0 || value === null || String(value).trim() === "" ? null : String(value);
+}
+function selectCanonicalOutputDocument(data = {}) {
+  const documents = Array.isArray(data.documents) ? data.documents : [];
+  const primaryId = primaryOutputDocumentId(data);
+  if (primaryId) {
+    const selected = documents.find((document) => documentId(document) === primaryId);
+    if (selected) return selected;
+  }
+  const candidates = documents.filter((document) => isOutputDocument(document) && !isArchivedOutputDocument(document));
+  const byNewest = (left, right) => {
+    const rightTime = new Date(right?.updated_at || right?.created_at || 0).getTime();
+    const leftTime = new Date(left?.updated_at || left?.created_at || 0).getTime();
+    return (Number.isFinite(rightTime) ? rightTime : 0) - (Number.isFinite(leftTime) ? leftTime : 0);
+  };
+  const contentful = candidates.filter((document) => documentContent(document).length > 0).sort(byNewest);
+  return contentful[0] || candidates.slice().sort(byNewest)[0] || null;
+}
+function canonicalizeEvidenceDocuments(session = {}) {
+  const documents = Array.isArray(session.documents) ? session.documents : [];
+  const primary = selectCanonicalOutputDocument(session);
+  const primaryId = documentId(primary);
+  const normalized = documents.map((document) => {
+    const id = documentId(document);
+    if (primary && document === primary) {
+      return {
+        ...document,
+        document_id: id || document.document_id,
+        document_role: "current_output",
+        document_state: "current",
+        selection_key: id || document.selection_key
+      };
+    }
+    if (isArchivedOutputDocument(document)) {
+      return {
+        ...document,
+        document_id: id || document.document_id,
+        document_role: "archived_output",
+        document_state: "archived",
+        selection_key: id || document.selection_key
+      };
+    }
+    if (isOutputDocument(document)) {
+      return {
+        ...document,
+        document_id: id || document.document_id,
+        document_role: "superseded_output",
+        document_state: "superseded",
+        selection_key: id || document.selection_key
+      };
+    }
+    return {
+      ...document,
+      document_id: id || document.document_id,
+      document_role: document.document_role || "working",
+      document_state: document.document_state || "working",
+      selection_key: id || document.selection_key
+    };
+  });
+  return {
+    documents: normalized,
+    primary: primaryId ? normalized.find((document) => documentId(document) === primaryId) || null : null,
+    primaryId
+  };
+}
 function artifactState(data = {}, kind = null) {
   const resolvedKind = kind || kindFromSession(data);
   if (resolvedKind === "dataset" || Array.isArray(data.rows)) {
-    const rowCount = Number(data.total_rows ?? data.row_count ?? data.rows?.length ?? data.dataset?.row_count ?? data.dataset?.rows?.length ?? 0);
-    return { kind: "dataset", present: rowCount > 0, row_count: rowCount };
+    const known2 = Array.isArray(data.rows) || Object.hasOwn(data, "total_rows") || Object.hasOwn(data, "row_count") || Object.hasOwn(data.dataset || {}, "row_count") || Object.hasOwn(data.dataset || {}, "rows");
+    const datasetRows = typeof data.dataset?.rows === "number" ? data.dataset.rows : data.dataset?.rows?.length;
+    const rowCount = Number(data.total_rows ?? data.row_count ?? data.rows?.length ?? data.dataset?.row_count ?? datasetRows ?? 0);
+    return { kind: "dataset", known: known2, present: known2 && rowCount > 0, row_count: rowCount };
+  }
+  const documents = Array.isArray(data.documents) ? data.documents : [];
+  const outputDocument = selectCanonicalOutputDocument(data);
+  const documentContent2 = outputDocument?.content_markdown ?? outputDocument?.content ?? "";
+  if (outputDocument) {
+    return {
+      kind: resolvedKind || "report",
+      known: true,
+      present: String(documentContent2).trim().length > 0,
+      character_count: String(documentContent2).length,
+      document_id: documentId(outputDocument)
+    };
   }
   const content = data.content_markdown ?? data.content ?? data.output?.content_markdown ?? data.output?.content;
   if (typeof content === "string") {
-    return { kind: "report", present: content.trim().length > 0, character_count: content.length };
+    return { kind: "report", known: true, present: content.trim().length > 0, character_count: content.length };
   }
-  const documents = Array.isArray(data.documents) ? data.documents : [];
-  const outputDocument = documents.find((document) => document.document_role === "current_output" || document.is_output === true && document.doc_type !== "output_archived");
-  const documentContent = outputDocument?.content_markdown ?? outputDocument?.content ?? "";
-  return { kind: resolvedKind || "report", present: String(documentContent).trim().length > 0, character_count: String(documentContent).length };
+  const outputWordCount = Number(!Array.isArray(data.documents) ? data.documents?.output_word_count : 0);
+  const availableOutput = !Array.isArray(data.documents) && Array.isArray(data.documents?.available) ? data.documents.available.some((document) => document?.is_output === true && document?.doc_type !== "output_archived" && Number(document?.line_count || 0) > 0) : false;
+  const known = Array.isArray(data.documents) && documents.length > 0 || Object.hasOwn(data.documents || {}, "output_word_count") || Array.isArray(data.documents?.available);
+  const present = String(documentContent2).trim().length > 0 || outputWordCount > 0 || availableOutput;
+  return {
+    kind: resolvedKind || "report",
+    known,
+    present: known && present,
+    character_count: String(documentContent2).length,
+    output_word_count: Number.isFinite(outputWordCount) ? outputWordCount : 0
+  };
+}
+function isCurrentFinalArtifact(data = {}, kind = null) {
+  const resolvedKind = kind || kindFromSession(data);
+  if (resolvedKind === "dataset" || Array.isArray(data.rows)) return true;
+  if (data.document_role === "current_output" || data.document_state === "current") return true;
+  if (data.doc_type === "output_archived" || data.document_role === "archived_output" || data.document_state === "archived") {
+    return false;
+  }
+  return data.is_output === true || data.doc_type === "output";
 }
 var SUCCESSFUL_COMPLETION_STATUSES = /* @__PURE__ */ new Set(["completed", "complete", "succeeded", "success", "finished"]);
 var SUCCESSFUL_COMPLETION_REASONS = /* @__PURE__ */ new Set(["budget_complete", "natural_complete", "completed", "complete", "succeeded", "success", "finished"]);
@@ -23750,7 +24614,32 @@ function completionContract(value = {}) {
   }
   const successfulStatus = SUCCESSFUL_COMPLETION_STATUSES.has(status);
   const successfulReason = !reason || SUCCESSFUL_COMPLETION_REASONS.has(reason);
-  const successful = value.done === true && successfulStatus && successfulReason;
+  const terminalSuccessState = value.done === true && successfulStatus && successfulReason;
+  const outputReady = value.output_ready === true;
+  const artifact = artifactState(value);
+  const successful = terminalSuccessState && outputReady && artifact.known && artifact.present;
+  if (terminalSuccessState && outputReady && !artifact.known) {
+    return {
+      successful: false,
+      terminal: true,
+      code: "OUTPUT_UNVERIFIED",
+      status: 200,
+      retryable: true,
+      state: "output_unverified",
+      nextAction: "Call webhound_get_output, webhound_export_session, or webhound_get_evidence_pack to verify that the final artifact is nonempty."
+    };
+  }
+  if (terminalSuccessState && (!outputReady || !artifact.present)) {
+    return {
+      successful: false,
+      terminal: true,
+      code: "EMPTY_OUTPUT",
+      status: 422,
+      retryable: false,
+      state: "empty_output",
+      nextAction: "Call webhound_diagnose before resuming or rerunning; do not present this session as successfully completed."
+    };
+  }
   return {
     successful,
     terminal: value.done === true,
@@ -23763,6 +24652,11 @@ function completionContract(value = {}) {
     } : {}
   };
 }
+function terminalOutputCandidate(value = {}) {
+  const status = String(value.status || "").trim().toLowerCase();
+  const reason = String(value.completion_reason || "").trim().toLowerCase();
+  return value.done === true && value.output_ready === true && SUCCESSFUL_COMPLETION_STATUSES.has(status) && (!reason || SUCCESSFUL_COMPLETION_REASONS.has(reason));
+}
 function withCompletionContract(value = {}) {
   const contract = completionContract(value);
   return {
@@ -23773,7 +24667,7 @@ function withCompletionContract(value = {}) {
 }
 function assertTerminalOutputReady(status = {}, { allowPartial = false } = {}) {
   const contract = completionContract(status);
-  if (contract.terminal && !contract.successful && !allowPartial && !["AWAITING_INPUT", "SESSION_PAUSED"].includes(contract.code)) {
+  if (contract.terminal && !contract.successful && !allowPartial && !["AWAITING_INPUT", "SESSION_PAUSED", "OUTPUT_UNVERIFIED"].includes(contract.code)) {
     throw webhoundError(`The session ended in a non-success state: ${contract.state}.`, {
       code: contract.code,
       status: contract.status,
@@ -23814,9 +24708,9 @@ function assertArtifactPresent(state, sessionId) {
 function terminalAlerts(data = {}) {
   const alerts = userVisibleAlerts(data);
   const contract = completionContract(data);
-  if (contract.terminal && !contract.successful && !alerts.some((alert) => String(alert.code || "").toUpperCase() === contract.code)) {
+  if (contract.terminal && !contract.successful && contract.code !== "OUTPUT_UNVERIFIED" && !alerts.some((alert) => String(alert.code || "").toUpperCase() === contract.code)) {
     alerts.push({
-      severity: ["SESSION_FAILED", "CREDIT_EXHAUSTED", "UNSUCCESSFUL_COMPLETION"].includes(contract.code) ? "error" : "warning",
+      severity: ["SESSION_FAILED", "CREDIT_EXHAUSTED", "UNSUCCESSFUL_COMPLETION", "EMPTY_OUTPUT", "DATASET_ZERO_ROWS"].includes(contract.code) ? "error" : "warning",
       code: contract.code,
       message: `The session is not a successful completion: ${contract.state}.`,
       next_action: contract.nextAction
@@ -23875,6 +24769,13 @@ function runningGuidance(data) {
       forbidden_next_tools: []
     };
   }
+  if (completion.code === "OUTPUT_UNVERIFIED") {
+    return {
+      mcp_next_action: "read_output",
+      agent_instruction: `The run reports done=true and output_ready=true. Read or export the final artifact now; only present it as complete after the fetched artifact is nonempty. ${evidencePackInstruction()}`,
+      forbidden_next_tools: []
+    };
+  }
   if (completion.terminal) {
     return {
       mcp_next_action: "inspect_diagnostics",
@@ -23908,10 +24809,20 @@ async function buildEvidencePack(client, sessionId, options = {}, status = null)
       nextAction: `Retry with kind: "${actualKind}" or kind: "auto".`
     });
   }
+  const canonicalDocuments = canonicalizeEvidenceDocuments(session);
+  const artifacts = {
+    ...session.artifacts || {},
+    primary_output_document_id: canonicalDocuments.primaryId
+  };
+  const canonicalSession = {
+    ...session,
+    documents: canonicalDocuments.documents,
+    artifacts
+  };
   const excludedByRequest = [];
-  const documents = options.include_working_docs === false ? (session.documents || []).filter((document) => document.document_role === "current_output" || document.is_output && document.doc_type !== "output_archived") : session.documents;
+  const documents = options.include_working_docs === false ? canonicalDocuments.documents.filter((document) => document.document_role === "current_output") : canonicalDocuments.documents;
   if (options.include_working_docs === false) excludedByRequest.push("working_documents");
-  const evidence = { ...session.evidence || {} };
+  const evidence = { ...canonicalSession.evidence || {} };
   if (options.include_claims === false) {
     delete evidence.claims;
     excludedByRequest.push("claims");
@@ -23920,12 +24831,12 @@ async function buildEvidencePack(client, sessionId, options = {}, status = null)
     delete evidence.sources;
     excludedByRequest.push("sources");
   }
-  const artifact = artifactState(session, actualKind);
-  const completion = completionContract(status || {});
-  if (completion.successful) assertArtifactPresent(artifact, sessionId);
-  const complete = completion.successful && status?.output_ready === true && artifact.present && excludedByRequest.length === 0;
+  const artifact = artifactState(canonicalSession, actualKind);
+  const terminalCandidate = terminalOutputCandidate(status || {});
+  if (terminalCandidate) assertArtifactPresent(artifact, sessionId);
+  const complete = terminalCandidate && status?.output_ready === true && artifact.present && excludedByRequest.length === 0;
   return {
-    ...session,
+    ...canonicalSession,
     documents,
     evidence,
     complete_session: complete,
@@ -23973,11 +24884,11 @@ function errorResult(error2, fallback = "Webhound MCP tool failed") {
       no_spend: true,
       action_started: false,
       original_tool: originalTool,
-      session_started: isStartTool ? false : null,
+      ...isStartTool ? { session_started: false } : {},
       billing_url: billingUrl,
       top_up_url: billingUrl,
-      required: Number.isFinite(required2) ? required2 : null,
-      current_balance: Number.isFinite(balance) ? balance : null,
+      ...Number.isFinite(required2) ? { required: required2 } : {},
+      ...Number.isFinite(balance) ? { current_balance: balance } : {},
       auto_recharge_enabled: !!body.auto_recharge_enabled,
       api_message: body.message || error2?.message || fallback,
       agent_instruction: [
@@ -24001,24 +24912,26 @@ function errorResult(error2, fallback = "Webhound MCP tool failed") {
     };
     return jsonResult(`Billing setup needed before Webhound can continue.
 
-${userMessage}`, data2, false);
+${userMessage}`, data2, true);
   }
   const code = error2?.code || (Number(status) === 404 ? "SESSION_NOT_FOUND" : Number(status) === 401 ? "AUTH_REQUIRED" : Number(status) === 403 ? "FORBIDDEN" : Number(status) >= 500 ? "API_UNAVAILABLE" : "WEBHOUND_ERROR");
-  const retryable = error2?.retryable === true || Number(status) === 429 || Number(status) >= 500;
+  const retryable = typeof error2?.retryable === "boolean" ? error2.retryable : Number(status) === 429 || Number(status) >= 500;
   const nextAction = error2?.nextAction || (code === "SESSION_NOT_FOUND" ? "Verify the session ID and authenticated account. Do not call webhound_wait again for this ID." : code === "AUTH_REQUIRED" ? "Authenticate Webhound, then call webhound_health before retrying." : retryable ? "Retry only after confirming API reachability or waiting for the transient failure to clear." : "Correct the request before retrying.");
   const message = error2?.message || fallback;
+  const rawBody = error2?.body;
+  const canonicalBody = rawBody === null || rawBody === void 0 ? null : typeof rawBody === "object" && !Array.isArray(rawBody) ? rawBody : { upstream_body: rawBody };
   const data = {
-    error: error2?.body?.error || code,
+    error: canonicalBody?.error || code,
     code,
     message,
     status,
     retryable,
     next_action: nextAction,
-    body: error2?.body || null,
+    body: canonicalBody,
     error_details: {
       code,
       message,
-      status: Number.isFinite(Number(status)) ? Number(status) : null,
+      status: hasFiniteNumber(status) ? Number(status) : null,
       retryable,
       next_action: nextAction
     },
@@ -24041,21 +24954,87 @@ Open: ${client.webUrl(sessionId)}
 
 Keep doing useful independent work while Webhound runs. Save concrete source-backed notes with webhound_add_sidecar_notes instead of steering. ${checkIn.instruction} Watch until done=true; output_ready by itself is not terminal.${freeRun}`;
 }
+var MUTATING_RESULT_TOOLS = /* @__PURE__ */ new Set([
+  "webhound_set_defaults",
+  "webhound_start_report",
+  "webhound_start_dataset",
+  "webhound_add_sidecar_notes",
+  "webhound_update_sidecar_note",
+  "webhound_send_message",
+  "webhound_stop",
+  "webhound_resume",
+  "webhound_add_budget",
+  "webhound_set_budget",
+  "webhound_get_shareable_link",
+  "webhound_upload_file"
+]);
+var MUTATION_RECONCILIATION_ACTIONS = Object.freeze({
+  webhound_set_defaults: "Call webhound_get_defaults to see whether the settings changed before attempting another update.",
+  webhound_start_report: "Search or list recent sessions and inspect account usage for a matching report before retrying. Retry only after confirming no report was created.",
+  webhound_start_dataset: "Search or list recent sessions and inspect account usage for a matching dataset before retrying. Retry only after confirming no dataset was created.",
+  webhound_add_sidecar_notes: "Call webhound_list_sidecar_notes to see whether the notes were saved before retrying.",
+  webhound_update_sidecar_note: "Call webhound_list_sidecar_notes to inspect the note state before retrying the update.",
+  webhound_send_message: "Call webhound_watch or webhound_get_session to inspect the latest session state and messages before sending the guidance again.",
+  webhound_stop: "Call webhound_watch to see whether the stop took effect before sending another stop request.",
+  webhound_resume: "Call webhound_watch and webhound_account to determine whether the session resumed or any budget changed before retrying.",
+  webhound_add_budget: "Call webhound_get_session and webhound_account to reconcile the session budget and usage before adding budget again.",
+  webhound_set_budget: "Call webhound_watch or webhound_get_session to read the current budget before attempting another change.",
+  webhound_get_shareable_link: "Inspect the session visibility and existing public link in Webhound before requesting another share link.",
+  webhound_upload_file: "Inspect the Webhound file or attachment state before uploading the same file again."
+});
+function assertSemanticToolResult(name, data) {
+  if (data?.error_details) return;
+  const issue2 = toolSuccessContractIssue(name, data);
+  if (!issue2) return;
+  const mutating = MUTATING_RESULT_TOOLS.has(name);
+  throw webhoundError(
+    mutating ? `Webhound could not confirm whether ${name} took effect.` : `Webhound returned an incomplete successful response for ${name}.`,
+    {
+      code: mutating ? "UNKNOWN_OUTCOME" : "UPSTREAM_CONTRACT_ERROR",
+      status: mutating ? null : 502,
+      retryable: false,
+      body: { tool: name, issue: issue2 },
+      nextAction: mutating ? MUTATION_RECONCILIATION_ACTIONS[name] : "Do not treat this response as valid. Report the upstream contract mismatch before retrying."
+    }
+  );
+}
+function normalizeToolResult(name, result) {
+  if (!result?.structuredContent || typeof result.structuredContent !== "object" || Array.isArray(result.structuredContent)) {
+    return result;
+  }
+  const schema = TOOL_OUTPUT_SCHEMAS[name];
+  const parsed = schema.strip().safeParse({
+    ...result.structuredContent,
+    tool: name
+  });
+  if (!parsed.success) {
+    throw webhoundError(`Webhound produced an invalid ${name} response.`, {
+      code: "MCP_OUTPUT_CONTRACT_ERROR",
+      status: 500,
+      retryable: false,
+      body: {
+        issues: parsed.error.issues.map((issue2) => ({
+          path: issue2.path.join("."),
+          code: issue2.code,
+          message: issue2.message
+        }))
+      },
+      nextAction: "Do not repeat a mutating tool blindly. Report this contract error so Webhound can correct the response mapping."
+    });
+  }
+  assertSemanticToolResult(name, parsed.data);
+  return {
+    ...result,
+    structuredContent: parsed.data
+  };
+}
 function registerTool(server2, client, name, config2, handler) {
   server2.registerTool(name, completeToolConfig(name, config2), async (args2) => {
     const previousToolContext = client?.setToolContext ? client.setToolContext(name, VERSION) : null;
     try {
-      const result = await handler(args2 || {});
-      if (result?.structuredContent && typeof result.structuredContent === "object") {
-        result.structuredContent.tool = name;
-      }
-      return result;
+      return normalizeToolResult(name, await handler(args2 || {}));
     } catch (error2) {
-      const result = errorResult(error2, `${name} failed`);
-      if (result?.structuredContent && typeof result.structuredContent === "object") {
-        result.structuredContent.tool = name;
-      }
-      return result;
+      return normalizeToolResult(name, errorResult(error2, `${name} failed`));
     } finally {
       if (client?.restoreToolContext) client.restoreToolContext(previousToolContext);
     }
@@ -24163,7 +25142,7 @@ Webhound uses the budget for extraction depth; $1 buys about 15 minutes of resea
       client: external_exports.enum(ONBOARDING_CLIENTS).default("generic"),
       capabilities: external_exports.object({
         workspace_rules_supported: external_exports.boolean().optional()
-      }).strict().optional()
+      }).passthrough().optional()
     },
     annotations: { readOnlyHint: true, openWorldHint: false }
   }, async (args2) => {
@@ -24386,6 +25365,7 @@ Webhound uses the budget for extraction depth; $1 buys about 15 minutes of resea
       const data2 = await client.resume(session_id, { guidance: message });
       return jsonResult("Awaiting-input reply sent; Webhound resume requested.", {
         ...data2,
+        session_id: data2.session_id || session_id,
         reason,
         resumes_session: true,
         interrupting: false
@@ -24394,6 +25374,7 @@ Webhound uses the budget for extraction depth; $1 buys about 15 minutes of resea
     const data = await client.sendMessage(session_id, message);
     return jsonResult("User guidance sent to Webhound session; Planner will handle the user direction change.", {
       ...data,
+      session_id: data.session_id || session_id,
       reason,
       resumes_session: false,
       interrupting: true
@@ -24417,7 +25398,13 @@ Webhound uses the budget for extraction depth; $1 buys about 15 minutes of resea
       file_ids: external_exports.array(external_exports.string()).optional(),
       context_session_ids: external_exports.array(external_exports.string()).optional()
     }
-  }, async ({ session_id, ...args2 }) => jsonResult("Session resume requested.", await client.resume(session_id, args2)));
+  }, async ({ session_id, ...args2 }) => {
+    const data = await client.resume(session_id, args2);
+    return jsonResult("Session resume requested.", {
+      ...data,
+      additional_budget: args2.additional_budget
+    });
+  });
   registerTool(server2, client, "webhound_add_budget", {
     title: "Add Webhound Budget",
     description: "Add research budget and optional guidance/context to a session.",
@@ -24451,14 +25438,15 @@ Webhound uses the budget for extraction depth; $1 buys about 15 minutes of resea
       session_id: external_exports.string(),
       kind: external_exports.enum(["auto", "report", "dataset"]).default("auto"),
       doc_name: external_exports.string().optional(),
-      select: external_exports.enum(["output", "working", "latest"]).optional(),
+      select: external_exports.enum(["output", "working", "latest"]).default("output"),
       allow_partial: external_exports.boolean().default(false).describe("Set true only if the user explicitly asks for an interim/partial update before done=true. Partial output is not final and is not a reason to stop or finalize the run.")
     },
     annotations: { readOnlyHint: true, openWorldHint: false }
   }, async ({ session_id, allow_partial, ...args2 }) => {
     const status = withCompletionContract(await client.watch(session_id));
     assertTerminalOutputReady(status, { allowPartial: allow_partial });
-    if (!status.successful_completion && !allow_partial) {
+    const terminalCandidate = terminalOutputCandidate(status);
+    if (!terminalCandidate && !allow_partial) {
       const guidance = runningGuidance(status);
       const estimate = runtimeEstimate(status);
       return jsonResultWithOptions(
@@ -24470,8 +25458,23 @@ Webhound uses the budget for extraction depth; $1 buys about 15 minutes of resea
     const data = await client.getOutput(session_id, args2);
     const actualKind = kindFromSession(status) || (Array.isArray(data.rows) ? "dataset" : "report");
     const artifact = artifactState(data, actualKind);
-    if (status.successful_completion) assertArtifactPresent(artifact, session_id);
-    const completeOutput = status.successful_completion === true && status.output_ready === true && artifact.present;
+    const currentFinalArtifact = isCurrentFinalArtifact(data, actualKind);
+    if (terminalCandidate && currentFinalArtifact) assertArtifactPresent(artifact, session_id);
+    if (terminalCandidate && actualKind === "report" && args2.select === "output" && !args2.doc_name && !currentFinalArtifact) {
+      throw webhoundError("The report output endpoint did not return the current final document.", {
+        code: "NON_FINAL_OUTPUT_SELECTED",
+        status: 502,
+        retryable: false,
+        body: {
+          session_id,
+          doc_name: data.doc_name || null,
+          doc_type: data.doc_type || null,
+          is_output: data.is_output === true
+        },
+        nextAction: "Do not present this document as final. Report the selection mismatch so Webhound can correct the current-output mapping."
+      });
+    }
+    const completeOutput = terminalCandidate && currentFinalArtifact && artifact.present;
     const structured = {
       ...data,
       complete_output: completeOutput,
@@ -24480,13 +25483,13 @@ Webhound uses the budget for extraction depth; $1 buys about 15 minutes of resea
       artifact,
       truncated: false,
       omitted: [],
-      ...status?.successful_completion ? {
+      ...completeOutput ? {
         evidence_pack_instruction: evidencePackInstruction(),
         next_research_instruction: nextResearchInstruction()
       } : {}
     };
     const size = typeof data.content_markdown === "string" ? `${data.content_markdown.length} Markdown characters` : `${data.total_rows || data.rows?.length || 0} rows`;
-    const prefix = completeOutput ? "Complete output" : "Partial output snapshot";
+    const prefix = completeOutput ? "Complete output" : "Working or partial output snapshot";
     return jsonResultWithOptions(`${prefix} for ${session_id}: ${size}; nothing truncated or omitted.`, structured);
   });
   registerTool(server2, client, "webhound_export_session", {
@@ -24505,7 +25508,8 @@ Webhound uses the budget for extraction depth; $1 buys about 15 minutes of resea
   }, async ({ session_id, include_content, include_binary_base64, allow_partial, ...args2 }) => {
     const status = withCompletionContract(await client.watch(session_id));
     assertTerminalOutputReady(status, { allowPartial: allow_partial });
-    if (!status.successful_completion && !allow_partial) {
+    const terminalCandidate = terminalOutputCandidate(status);
+    if (!terminalCandidate && !allow_partial) {
       const guidance = runningGuidance(status);
       const estimate = runtimeEstimate(status);
       return jsonResultWithOptions(
@@ -24518,7 +25522,18 @@ Webhound uses the budget for extraction depth; $1 buys about 15 minutes of resea
     const content = data.content || "";
     const isBase64 = data.encoding === "base64";
     const delivery = include_content && !isBase64 ? "inline_text" : include_content && isBase64 && include_binary_base64 ? "inline_base64" : data.download_url ? "download_url" : "none";
-    const completeExport = status.successful_completion === true && status.output_ready === true && delivery !== "none";
+    const artifactBytes = Number(data.size_bytes || 0);
+    const deliveredArtifactPresent = artifactBytes > 0 || String(content).length > 0;
+    if (terminalCandidate && !deliveredArtifactPresent) {
+      throw webhoundError("The completed session export contains no artifact bytes.", {
+        code: kindFromSession(status) === "dataset" ? "DATASET_ZERO_ROWS" : "EMPTY_OUTPUT",
+        status: 422,
+        retryable: false,
+        body: { session_id, delivery, size_bytes: Number.isFinite(artifactBytes) ? artifactBytes : 0 },
+        nextAction: "Call webhound_diagnose before resuming or rerunning; do not present this export as complete."
+      });
+    }
+    const completeExport = terminalCandidate && deliveredArtifactPresent && delivery !== "none";
     const structured = {
       ...data,
       content: include_content && !isBase64 ? String(content) : void 0,
@@ -24528,12 +25543,12 @@ Webhound uses the budget for extraction depth; $1 buys about 15 minutes of resea
       content_truncated: false,
       omitted: isBase64 && include_content && !include_binary_base64 ? ["binary_base64"] : [],
       binary_download_url: isBase64 && !include_binary_base64 ? data.download_url : void 0,
-      ...status?.successful_completion ? {
+      ...completeExport ? {
         evidence_pack_instruction: evidencePackInstruction(),
         next_research_instruction: nextResearchInstruction()
       } : {}
     };
-    const terminalInstruction = status.successful_completion ? ` ${evidencePackInstruction()}` : "";
+    const terminalInstruction = completeExport ? ` ${evidencePackInstruction()}` : "";
     const summary = `${completeExport ? "Exported" : "Partially exported"} ${session_id} as ${data.filename} (${data.mime_type}, ${data.size_bytes} bytes).${terminalInstruction}`;
     return jsonResultWithOptions(isBase64 && !include_binary_base64 ? `${summary} The complete binary is at download_url; set include_binary_base64=true only if raw bytes are required.` : `${summary} Content is complete and uncapped.`, structured);
   });
@@ -24552,7 +25567,7 @@ Webhound uses the budget for extraction depth; $1 buys about 15 minutes of resea
   }, async ({ session_id, allow_partial, ...args2 }) => {
     const status = withCompletionContract(await client.watch(session_id));
     assertTerminalOutputReady(status, { allowPartial: allow_partial });
-    if (!status.successful_completion && !allow_partial) {
+    if (!terminalOutputCandidate(status) && !allow_partial) {
       const guidance = runningGuidance(status);
       const estimate = runtimeEstimate(status);
       return jsonResultWithOptions(
@@ -24591,13 +25606,19 @@ Webhound uses the budget for extraction depth; $1 buys about 15 minutes of resea
     description: "Read normalized claim traces and provenance for a session.",
     inputSchema: { session_id: external_exports.string() },
     annotations: { readOnlyHint: true, openWorldHint: false }
-  }, async ({ session_id }) => jsonResult("Claim traces for Webhound session.", await client.getClaims(session_id)));
+  }, async ({ session_id }) => jsonResult(
+    "Claim traces for Webhound session.",
+    { ...await client.getClaims(session_id), session_id }
+  ));
   registerTool(server2, client, "webhound_get_sources", {
     title: "Get Webhound Sources",
     description: "Read source inventory and citation counts for a session.",
     inputSchema: { session_id: external_exports.string() },
     annotations: { readOnlyHint: true, openWorldHint: false }
-  }, async ({ session_id }) => jsonResult("Sources for Webhound session.", await client.getSources(session_id)));
+  }, async ({ session_id }) => jsonResult(
+    "Sources for Webhound session.",
+    { ...await client.getSources(session_id), session_id }
+  ));
   registerTool(server2, client, "webhound_search_sessions", {
     title: "Search Webhound Sessions",
     description: "Semantic search across prior Webhound sessions.",
@@ -24628,7 +25649,7 @@ Webhound uses the budget for extraction depth; $1 buys about 15 minutes of resea
   });
   registerTool(server2, client, "webhound_upload_file", {
     title: "Upload Webhound File",
-    description: "Upload a CSV, XLSX, XLS, PDF, DOCX, DOC, TXT, Markdown, or VTT ChatGPT attachment, local file, text, or base64 content for use in a report or dataset.",
+    description: "Upload a CSV, XLSX, PDF, DOCX, TXT, Markdown, or VTT ChatGPT attachment, local file, text, or base64 content for use in a report or dataset. Convert legacy XLS/DOC files to XLSX/DOCX first.",
     inputSchema: {
       files: external_exports.array(CHATGPT_FILE_SCHEMA).max(10).optional(),
       local_path: external_exports.string().optional(),
@@ -24664,7 +25685,11 @@ Webhound uses the budget for extraction depth; $1 buys about 15 minutes of resea
             return "";
           }
         })();
-        const remoteMime = validateUploadMimeType(file.mime_type || downloaded.mimeType, file.file_name || remoteUrlName);
+        const remoteMime = preferredUploadMimeType(
+          file.mime_type,
+          downloaded.mimeType,
+          file.file_name || remoteUrlName
+        );
         const uploadName = file.file_name || safeUploadFilename(`chatgpt-${file.file_id}`, remoteMime);
         const result = await client.uploadFile({
           file_name: uploadName,
@@ -24713,7 +25738,7 @@ function printHelp() {
 Run Webhound's MCP server over stdio.
 
 Usage:
-  WEBHOUND_KEY=wh_... npx -y webhound-mcp
+  WEBHOUND_KEY=wh_... npx -y webhound-mcp@${VERSION}
   webhound-mcp --help
   webhound-mcp --version
   webhound-mcp --self-test

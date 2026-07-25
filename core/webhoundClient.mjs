@@ -1,13 +1,12 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { inflateRawSync } from 'node:zlib';
 
 const DEFAULT_API_BASE = 'https://api.webhound.ai/api/v2';
 const DEFAULT_APP_BASE = 'https://webhound.ai';
 const MAX_UPLOAD_BYTES = 50 * 1024 * 1024;
 const ALLOWED_UPLOAD_MIME_TYPES = new Set([
   'application/pdf',
-  'application/msword',
-  'application/vnd.ms-excel',
   'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
   'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
   'text/csv',
@@ -18,10 +17,8 @@ const ALLOWED_UPLOAD_MIME_TYPES = new Set([
 const UPLOAD_MIME_BY_EXTENSION = Object.freeze({
   '.csv': 'text/csv',
   '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-  '.xls': 'application/vnd.ms-excel',
   '.pdf': 'application/pdf',
   '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-  '.doc': 'application/msword',
   '.txt': 'text/plain',
   '.md': 'text/markdown',
   '.vtt': 'text/vtt',
@@ -29,6 +26,62 @@ const UPLOAD_MIME_BY_EXTENSION = Object.freeze({
 const UPLOAD_EXTENSION_BY_MIME = Object.freeze(Object.fromEntries(
   Object.entries(UPLOAD_MIME_BY_EXTENSION).map(([extension, mime]) => [mime, extension])
 ));
+const UPLOAD_MIME_ALIASES_BY_EXTENSION = Object.freeze({
+  '.csv': new Set(['text/csv', 'application/csv', 'application/vnd.ms-excel', 'application/octet-stream']),
+  '.xlsx': new Set(['application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'application/zip', 'application/octet-stream']),
+  '.pdf': new Set(['application/pdf', 'application/octet-stream']),
+  '.docx': new Set(['application/vnd.openxmlformats-officedocument.wordprocessingml.document', 'application/zip', 'application/octet-stream']),
+  '.txt': new Set(['text/plain', 'application/octet-stream']),
+  '.md': new Set(['text/markdown', 'text/plain', 'application/octet-stream']),
+  '.vtt': new Set(['text/vtt', 'text/plain', 'application/octet-stream']),
+});
+const GENERIC_TRANSPORT_MIME_TYPES = new Set([
+  '',
+  'application/octet-stream',
+  'application/zip',
+]);
+const MAX_ZIP_ENTRIES = 10_000;
+const MAX_ZIP_UNCOMPRESSED_BYTES = 200 * 1024 * 1024;
+const MAX_ZIP_COMPRESSION_RATIO = 1_000;
+const MAX_PACKAGE_CONTROL_XML_BYTES = 2 * 1024 * 1024;
+const MAX_PACKAGE_MAIN_XML_BYTES = 16 * 1024 * 1024;
+const ZIP_LOCAL_FILE_HEADER = 0x04034b50;
+const ZIP_CENTRAL_DIRECTORY_HEADER = 0x02014b50;
+const ZIP_END_OF_CENTRAL_DIRECTORY = 0x06054b50;
+const ZIP_DATA_DESCRIPTOR = 0x08074b50;
+const OPC_CONTENT_TYPES_NAMESPACE = 'http://schemas.openxmlformats.org/package/2006/content-types';
+const OPC_RELATIONSHIPS_NAMESPACE = 'http://schemas.openxmlformats.org/package/2006/relationships';
+const OOXML_PACKAGE = Object.freeze({
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document': {
+    mainPart: 'word/document.xml',
+    contentType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml',
+    rootElement: 'document',
+    namespaces: new Set([
+      'http://schemas.openxmlformats.org/wordprocessingml/2006/main',
+      'http://purl.oclc.org/ooxml/wordprocessingml/main',
+    ]),
+  },
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': {
+    mainPart: 'xl/workbook.xml',
+    contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml',
+    rootElement: 'workbook',
+    namespaces: new Set([
+      'http://schemas.openxmlformats.org/spreadsheetml/2006/main',
+      'http://purl.oclc.org/ooxml/spreadsheetml/main',
+    ]),
+  },
+});
+const CRC32_TABLE = (() => {
+  const table = new Uint32Array(256);
+  for (let value = 0; value < 256; value += 1) {
+    let crc = value;
+    for (let bit = 0; bit < 8; bit += 1) {
+      crc = (crc & 1) !== 0 ? (0xedb88320 ^ (crc >>> 1)) : (crc >>> 1);
+    }
+    table[value] = crc >>> 0;
+  }
+  return table;
+})();
 
 const ERROR_CODES_BY_STATUS = Object.freeze({
   400: 'VALIDATION_ERROR',
@@ -208,6 +261,14 @@ function publicSessionCollection(value = {}) {
       result[key] = result[key].map(item => ({ ...publicSessionRecord(item), research_harness: 'Hound' }));
     }
   }
+  const page = Number(result.page);
+  const pageSize = Number(result.limit ?? result.page_size);
+  const totalPages = Number(result.total_pages);
+  const total = Number(result.total ?? result.total_count);
+  if (Number.isFinite(page)) result.page = page;
+  if (Number.isFinite(pageSize)) result.limit = pageSize;
+  if (Number.isFinite(total)) result.total = total;
+  if (Number.isFinite(page) && Number.isFinite(totalPages)) result.has_more = page < totalPages;
   return result;
 }
 
@@ -245,25 +306,39 @@ function normalizeMime(value = '') {
 }
 
 export function validateUploadMimeType(mimeType, fileName) {
+  const extension = path.extname(fileName || '').toLowerCase();
   const inferred = mimeFromFilename(fileName);
   const normalized = normalizeMime(mimeType || inferred);
+  const aliases = UPLOAD_MIME_ALIASES_BY_EXTENSION[extension];
+  if (aliases) {
+    if (normalized && !aliases.has(normalized)) {
+      throw webhoundError(`Filename "${fileName}" does not match declared MIME type "${normalized}".`, {
+        code: 'MIME_MISMATCH',
+        status: 415,
+        retryable: false,
+        nextAction: 'Use a filename extension that matches the validated MIME type.',
+      });
+    }
+    return inferred;
+  }
   if (!ALLOWED_UPLOAD_MIME_TYPES.has(normalized)) {
     throw webhoundError(`Unsupported upload MIME type "${normalized || 'unknown'}".`, {
       code: 'UNSUPPORTED_MEDIA_TYPE',
       status: 415,
       retryable: false,
-      nextAction: 'Use CSV, XLSX, XLS, PDF, DOCX, DOC, TXT, Markdown, or VTT.',
-    });
-  }
-  if (mimeType && inferred !== 'application/octet-stream' && inferred !== normalized) {
-    throw webhoundError(`Filename "${fileName}" does not match declared MIME type "${normalized}".`, {
-      code: 'MIME_MISMATCH',
-      status: 415,
-      retryable: false,
-      nextAction: 'Use a filename extension that matches the validated MIME type.',
+      nextAction: 'Use CSV, XLSX, PDF, DOCX, TXT, Markdown, or VTT. Convert legacy .xls/.doc files to .xlsx/.docx first.',
     });
   }
   return normalized;
+}
+
+export function preferredUploadMimeType(clientMimeType, responseMimeType, fileName) {
+  const clientMime = normalizeMime(clientMimeType);
+  const responseMime = normalizeMime(responseMimeType);
+  const declared = GENERIC_TRANSPORT_MIME_TYPES.has(clientMime)
+    ? (responseMime || clientMime)
+    : clientMime || responseMime;
+  return validateUploadMimeType(declared, fileName);
 }
 
 export function safeUploadFilename(baseName, mimeType) {
@@ -279,6 +354,14 @@ export function safeUploadFilename(baseName, mimeType) {
 
 function decodeBase64Strict(value) {
   const input = String(value || '');
+  const maximumEncodedLength = 4 * Math.ceil(MAX_UPLOAD_BYTES / 3);
+  if (input.length > maximumEncodedLength) {
+    throw webhoundError(`The uploaded file exceeds Webhound's ${MAX_UPLOAD_BYTES / (1024 * 1024)} MB limit.`, {
+      code: 'FILE_TOO_LARGE',
+      status: 413,
+      retryable: false,
+    });
+  }
   if (!input || input.length % 4 !== 0 || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(input)) {
     throw webhoundError('content_base64 must be non-empty, canonical base64 without whitespace or invalid characters.', {
       code: 'INVALID_BASE64',
@@ -288,6 +371,14 @@ function decodeBase64Strict(value) {
     });
   }
   const bytes = Buffer.from(input, 'base64');
+  if (bytes.toString('base64') !== input) {
+    throw webhoundError('content_base64 is not a canonical encoding of the supplied bytes.', {
+      code: 'INVALID_BASE64',
+      status: 400,
+      retryable: false,
+      nextAction: 'Encode the original file bytes as standard base64 and retry.',
+    });
+  }
   if (bytes.length === 0) {
     throw webhoundError('content_base64 decoded to an empty file.', {
       code: 'EMPTY_FILE',
@@ -315,17 +406,334 @@ function assertUploadSize(bytes) {
   }
 }
 
+function crc32(buffer) {
+  let crc = 0xffffffff;
+  for (const byte of buffer) crc = CRC32_TABLE[(crc ^ byte) & 0xff] ^ (crc >>> 8);
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function findZipEndOfCentralDirectory(buffer) {
+  const minimumOffset = Math.max(0, buffer.length - (65_535 + 22));
+  for (let offset = buffer.length - 22; offset >= minimumOffset; offset -= 1) {
+    if (buffer.readUInt32LE(offset) === ZIP_END_OF_CENTRAL_DIRECTORY) return offset;
+  }
+  return -1;
+}
+
+function decodeZipFilename(bytes, flags) {
+  const filename = bytes.toString((flags & 0x0800) !== 0 ? 'utf8' : 'latin1');
+  if (!filename || /[\u0000-\u001f\u007f]/.test(filename) || filename.includes('\uFFFD')) return null;
+  if (filename.includes('\\') || filename.startsWith('/') || /^[A-Za-z]:/.test(filename)) return null;
+  if (filename.split('/').some(part => part === '.' || part === '..')) return null;
+  return filename;
+}
+
+function parseZipArchive(buffer) {
+  const endOffset = findZipEndOfCentralDirectory(buffer);
+  if (endOffset < 0) return null;
+  const diskNumber = buffer.readUInt16LE(endOffset + 4);
+  const directoryDisk = buffer.readUInt16LE(endOffset + 6);
+  const entriesOnDisk = buffer.readUInt16LE(endOffset + 8);
+  const totalEntries = buffer.readUInt16LE(endOffset + 10);
+  const directorySize = buffer.readUInt32LE(endOffset + 12);
+  const directoryOffset = buffer.readUInt32LE(endOffset + 16);
+  const commentLength = buffer.readUInt16LE(endOffset + 20);
+  if (diskNumber !== 0 || directoryDisk !== 0 || entriesOnDisk !== totalEntries) return null;
+  if (totalEntries === 0 || totalEntries > MAX_ZIP_ENTRIES || totalEntries === 0xffff) return null;
+  if (directorySize === 0xffffffff || directoryOffset === 0xffffffff) return null;
+  if (endOffset + 22 + commentLength !== buffer.length || directoryOffset + directorySize !== endOffset) return null;
+
+  let offset = directoryOffset;
+  let uncompressedTotal = 0;
+  const entries = [];
+  const entryNames = new Set();
+  for (let index = 0; index < totalEntries; index += 1) {
+    if (offset + 46 > endOffset || buffer.readUInt32LE(offset) !== ZIP_CENTRAL_DIRECTORY_HEADER) return null;
+    const flags = buffer.readUInt16LE(offset + 8);
+    const method = buffer.readUInt16LE(offset + 10);
+    const checksum = buffer.readUInt32LE(offset + 16);
+    const compressedSize = buffer.readUInt32LE(offset + 20);
+    const uncompressedSize = buffer.readUInt32LE(offset + 24);
+    const filenameLength = buffer.readUInt16LE(offset + 28);
+    const extraLength = buffer.readUInt16LE(offset + 30);
+    const commentLengthForEntry = buffer.readUInt16LE(offset + 32);
+    const diskStart = buffer.readUInt16LE(offset + 34);
+    const localHeaderOffset = buffer.readUInt32LE(offset + 42);
+    const nextOffset = offset + 46 + filenameLength + extraLength + commentLengthForEntry;
+    if (nextOffset > endOffset || (flags & 0x0001) !== 0) return null;
+    if (![0, 8].includes(method) || diskStart !== 0 || localHeaderOffset === 0xffffffff) return null;
+    if (compressedSize === 0xffffffff || uncompressedSize === 0xffffffff) return null;
+    const filename = decodeZipFilename(buffer.subarray(offset + 46, offset + 46 + filenameLength), flags);
+    if (!filename || entryNames.has(filename)) return null;
+    entryNames.add(filename);
+    uncompressedTotal += uncompressedSize;
+    if (uncompressedTotal > MAX_ZIP_UNCOMPRESSED_BYTES) return null;
+    if (compressedSize === 0 && uncompressedSize > 0) return null;
+    if (compressedSize > 0 && uncompressedSize / compressedSize > MAX_ZIP_COMPRESSION_RATIO) return null;
+    entries.push({ filename, flags, method, checksum, compressedSize, uncompressedSize, localHeaderOffset });
+    offset = nextOffset;
+  }
+  if (offset !== directoryOffset + directorySize) return null;
+
+  const ranges = [];
+  for (const entry of entries) {
+    const localOffset = entry.localHeaderOffset;
+    if (localOffset + 30 > directoryOffset || buffer.readUInt32LE(localOffset) !== ZIP_LOCAL_FILE_HEADER) return null;
+    const localFlags = buffer.readUInt16LE(localOffset + 6);
+    const localMethod = buffer.readUInt16LE(localOffset + 8);
+    const localChecksum = buffer.readUInt32LE(localOffset + 14);
+    const localCompressedSize = buffer.readUInt32LE(localOffset + 18);
+    const localUncompressedSize = buffer.readUInt32LE(localOffset + 22);
+    const localNameLength = buffer.readUInt16LE(localOffset + 26);
+    const localExtraLength = buffer.readUInt16LE(localOffset + 28);
+    const localNameEnd = localOffset + 30 + localNameLength;
+    const dataOffset = localNameEnd + localExtraLength;
+    const dataEnd = dataOffset + entry.compressedSize;
+    if (localNameEnd > directoryOffset || dataOffset > directoryOffset || dataEnd > directoryOffset) return null;
+    const localFilename = decodeZipFilename(buffer.subarray(localOffset + 30, localNameEnd), localFlags);
+    if (localFilename !== entry.filename || localFlags !== entry.flags || localMethod !== entry.method) return null;
+    let rangeEnd = dataEnd;
+    if ((entry.flags & 0x0008) === 0) {
+      if (
+        localChecksum !== entry.checksum
+        || localCompressedSize !== entry.compressedSize
+        || localUncompressedSize !== entry.uncompressedSize
+      ) return null;
+    } else {
+      const hasSignature = dataEnd + 4 <= directoryOffset
+        && buffer.readUInt32LE(dataEnd) === ZIP_DATA_DESCRIPTOR;
+      const descriptorOffset = dataEnd + (hasSignature ? 4 : 0);
+      if (descriptorOffset + 12 > directoryOffset) return null;
+      if (
+        buffer.readUInt32LE(descriptorOffset) !== entry.checksum
+        || buffer.readUInt32LE(descriptorOffset + 4) !== entry.compressedSize
+        || buffer.readUInt32LE(descriptorOffset + 8) !== entry.uncompressedSize
+      ) return null;
+      rangeEnd = descriptorOffset + 12;
+    }
+    entry.dataOffset = dataOffset;
+    ranges.push({ start: localOffset, end: rangeEnd });
+  }
+  ranges.sort((left, right) => left.start - right.start);
+  if (ranges[0]?.start !== 0 || ranges.at(-1)?.end !== directoryOffset) return null;
+  for (let index = 1; index < ranges.length; index += 1) {
+    if (ranges[index].start !== ranges[index - 1].end) return null;
+  }
+  return { entries, byName: new Map(entries.map(entry => [entry.filename, entry])) };
+}
+
+function extractZipEntry(buffer, entry, maxBytes) {
+  if (!entry || entry.uncompressedSize > maxBytes) return null;
+  const compressed = buffer.subarray(entry.dataOffset, entry.dataOffset + entry.compressedSize);
+  let content;
+  try {
+    content = entry.method === 0
+      ? Buffer.from(compressed)
+      : inflateRawSync(compressed, { maxOutputLength: Math.max(maxBytes, 1) });
+  } catch {
+    return null;
+  }
+  if (content.length !== entry.uncompressedSize || crc32(content) !== entry.checksum) return null;
+  return content;
+}
+
+function safeXml(buffer) {
+  if (!buffer || buffer.includes(0)) return null;
+  const xml = buffer.toString('utf8').replace(/^\uFEFF/, '');
+  if (!xml.trimStart().startsWith('<') || xml.includes('\uFFFD') || /<!DOCTYPE/i.test(xml)) return null;
+  return xml;
+}
+
+function xmlAttributes(fragment) {
+  const attributes = {};
+  let offset = 0;
+  while (offset < fragment.length) {
+    while (/\s/.test(fragment[offset] || '')) offset += 1;
+    if (offset >= fragment.length) break;
+    const nameMatch = /^[A-Za-z_:][A-Za-z0-9_.:-]*/.exec(fragment.slice(offset));
+    if (!nameMatch) return null;
+    const name = nameMatch[0];
+    if (Object.hasOwn(attributes, name)) return null;
+    offset += name.length;
+    while (/\s/.test(fragment[offset] || '')) offset += 1;
+    if (fragment[offset] !== '=') return null;
+    offset += 1;
+    while (/\s/.test(fragment[offset] || '')) offset += 1;
+    const quote = fragment[offset];
+    if (quote !== '"' && quote !== "'") return null;
+    const valueEnd = fragment.indexOf(quote, offset + 1);
+    if (valueEnd < 0) return null;
+    attributes[name] = fragment.slice(offset + 1, valueEnd);
+    offset = valueEnd + 1;
+  }
+  return attributes;
+}
+
+function findXmlTagEnd(xml, start) {
+  let quote = null;
+  for (let offset = start; offset < xml.length; offset += 1) {
+    const character = xml[offset];
+    if (quote) {
+      if (character === quote) quote = null;
+    } else if (character === '"' || character === "'") {
+      quote = character;
+    } else if (character === '>') {
+      return offset;
+    }
+  }
+  return -1;
+}
+
+function parseXmlDocument(xml) {
+  if (!xml) return null;
+  const stack = [];
+  const elements = [];
+  let root = null;
+  let offset = 0;
+  while (offset < xml.length) {
+    const tagStart = xml.indexOf('<', offset);
+    if (tagStart < 0) {
+      if (stack.length === 0 && xml.slice(offset).trim()) return null;
+      break;
+    }
+    if (stack.length === 0 && xml.slice(offset, tagStart).trim()) return null;
+    if (xml.startsWith('<!--', tagStart)) {
+      const end = xml.indexOf('-->', tagStart + 4);
+      if (end < 0) return null;
+      offset = end + 3;
+      continue;
+    }
+    if (xml.startsWith('<![CDATA[', tagStart)) {
+      if (stack.length === 0) return null;
+      const end = xml.indexOf(']]>', tagStart + 9);
+      if (end < 0) return null;
+      offset = end + 3;
+      continue;
+    }
+    if (xml.startsWith('<?', tagStart)) {
+      const end = xml.indexOf('?>', tagStart + 2);
+      if (end < 0) return null;
+      offset = end + 2;
+      continue;
+    }
+    if (xml.startsWith('<!', tagStart)) return null;
+    const tagEnd = findXmlTagEnd(xml, tagStart + 1);
+    if (tagEnd < 0) return null;
+    let body = xml.slice(tagStart + 1, tagEnd).trim();
+    if (!body) return null;
+    if (body.startsWith('/')) {
+      const closingName = body.slice(1).trim();
+      if (!/^[A-Za-z_:][A-Za-z0-9_.:-]*$/.test(closingName) || stack.pop()?.name !== closingName) return null;
+      offset = tagEnd + 1;
+      continue;
+    }
+    const selfClosing = /\/\s*$/.test(body);
+    if (selfClosing) body = body.replace(/\/\s*$/, '').trimEnd();
+    const nameMatch = /^[A-Za-z_:][A-Za-z0-9_.:-]*/.exec(body);
+    if (!nameMatch) return null;
+    const name = nameMatch[0];
+    const attributes = xmlAttributes(body.slice(name.length));
+    if (!attributes) return null;
+    const namespaces = new Map(stack.at(-1)?.namespaces || []);
+    for (const [attributeName, value] of Object.entries(attributes)) {
+      if (attributeName === 'xmlns') namespaces.set('', value);
+      else if (attributeName.startsWith('xmlns:')) namespaces.set(attributeName.slice(6), value);
+    }
+    const prefix = name.includes(':') ? name.slice(0, name.indexOf(':')) : '';
+    const namespaceUri = namespaces.get(prefix) || null;
+    if (stack.length === 0) {
+      if (root) return null;
+      root = name;
+    }
+    elements.push({
+      name,
+      localName: name.includes(':') ? name.slice(name.lastIndexOf(':') + 1) : name,
+      attributes,
+      namespaceUri,
+    });
+    if (!selfClosing) stack.push({ name, namespaces });
+    offset = tagEnd + 1;
+  }
+  if (!root || stack.length !== 0) return null;
+  return {
+    root,
+    rootLocalName: root.includes(':') ? root.slice(root.lastIndexOf(':') + 1) : root,
+    elements,
+  };
+}
+
+function normalizeRelationshipTarget(value) {
+  const target = String(value || '');
+  if (
+    !target
+    || target.includes('\\')
+    || target.includes('\0')
+    || target.startsWith('//')
+    || /^[A-Za-z][A-Za-z0-9+.-]*:/.test(target)
+    || /[?#]/.test(target)
+    || target.split('/').some(part => part === '..')
+  ) {
+    return null;
+  }
+  return path.posix.normalize(`/${target}`).replace(/^\/+/, '') || null;
+}
+
+function inspectOoxmlArchive(mimeType, buffer) {
+  const definition = OOXML_PACKAGE[mimeType];
+  if (!definition || buffer.length < 4 || buffer.readUInt32LE(0) !== ZIP_LOCAL_FILE_HEADER) return false;
+  const archive = parseZipArchive(buffer);
+  if (!archive) return false;
+  for (const entry of archive.entries) {
+    if (extractZipEntry(buffer, entry, entry.uncompressedSize) === null) return false;
+  }
+  const contentTypes = parseXmlDocument(safeXml(extractZipEntry(
+    buffer,
+    archive.byName.get('[Content_Types].xml'),
+    MAX_PACKAGE_CONTROL_XML_BYTES
+  )));
+  const relationships = parseXmlDocument(safeXml(extractZipEntry(
+    buffer,
+    archive.byName.get('_rels/.rels'),
+    MAX_PACKAGE_CONTROL_XML_BYTES
+  )));
+  const mainDocument = parseXmlDocument(safeXml(extractZipEntry(
+    buffer,
+    archive.byName.get(definition.mainPart),
+    MAX_PACKAGE_MAIN_XML_BYTES
+  )));
+  if (!contentTypes || !relationships || !mainDocument) return false;
+  if (
+    contentTypes.rootLocalName !== 'Types'
+    || relationships.rootLocalName !== 'Relationships'
+    || mainDocument.rootLocalName !== definition.rootElement
+  ) return false;
+  if (
+    contentTypes.elements[0]?.namespaceUri !== OPC_CONTENT_TYPES_NAMESPACE
+    || relationships.elements[0]?.namespaceUri !== OPC_RELATIONSHIPS_NAMESPACE
+    || !definition.namespaces.has(mainDocument.elements[0]?.namespaceUri)
+  ) return false;
+  const hasContentType = contentTypes.elements.some(element => (
+    element.localName === 'Override'
+    && element.namespaceUri === OPC_CONTENT_TYPES_NAMESPACE
+    && element.attributes.PartName === `/${definition.mainPart}`
+    && element.attributes.ContentType === definition.contentType
+  ));
+  const hasOfficeRelationship = relationships.elements.some(element => (
+    element.localName === 'Relationship'
+    && element.namespaceUri === OPC_RELATIONSHIPS_NAMESPACE
+    && String(element.attributes.Type || '').endsWith('/officeDocument')
+    && String(element.attributes.TargetMode || '').toLowerCase() !== 'external'
+    && normalizeRelationshipTarget(element.attributes.Target) === definition.mainPart
+  ));
+  return hasContentType && hasOfficeRelationship;
+}
+
 function assertMimeMatchesBytes(bytes, mimeType) {
-  const starts = (...values) => values.every((value, index) => bytes[index] === value);
   const isPdf = bytes.subarray(0, 5).toString('ascii') === '%PDF-';
-  const isZip = starts(0x50, 0x4b, 0x03, 0x04) || starts(0x50, 0x4b, 0x05, 0x06) || starts(0x50, 0x4b, 0x07, 0x08);
-  const isCompoundDocument = starts(0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1);
   const checks = {
     'application/pdf': isPdf,
-    'application/msword': isCompoundDocument,
-    'application/vnd.ms-excel': isCompoundDocument,
-    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': isZip,
-    'application/vnd.openxmlformats-officedocument.wordprocessingml.document': isZip,
+    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': inspectOoxmlArchive(mimeType, bytes),
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document': inspectOoxmlArchive(mimeType, bytes),
   };
   if (Object.hasOwn(checks, mimeType) && !checks[mimeType]) {
     throw webhoundError(`File bytes do not match declared MIME type "${mimeType}".`, {
@@ -395,115 +803,255 @@ function datasetCellClaims(full, sessionId) {
   return claims;
 }
 
-function normalizeAttributeType(value) {
-  const raw = Array.isArray(value) ? value.find(item => item !== 'null') : value;
-  if (raw === 'integer') return 'number';
-  if (['string', 'number', 'boolean', 'object'].includes(raw)) return raw;
-  return 'string';
+const MAX_DATASET_ATTRIBUTES = 200;
+const DATASET_ATTRIBUTE_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_.-]{0,127}$/;
+const DATASET_JSON_TYPES = new Set(['string', 'number', 'integer', 'boolean', 'array', 'object']);
+
+function datasetSchemaError(message, nextAction = null) {
+  throw webhoundError(message, {
+    code: 'INVALID_DATASET_SCHEMA',
+    status: 400,
+    retryable: false,
+    nextAction: nextAction || 'Use a Webhound native attributes schema or a standard object JSON Schema.',
+  });
+}
+
+function datasetString(value, field, { required = false, max = 2000 } = {}) {
+  if (value == null || value === '') {
+    if (required) datasetSchemaError(`${field} is required.`);
+    return '';
+  }
+  if (typeof value !== 'string') datasetSchemaError(`${field} must be a string.`);
+  const normalized = value.trim();
+  if (required && !normalized) datasetSchemaError(`${field} is required.`);
+  if (normalized.length > max) datasetSchemaError(`${field} must be at most ${max} characters.`);
+  return normalized;
+}
+
+function datasetStringArray(value, field) {
+  if (value == null) return [];
+  if (!Array.isArray(value) || value.some(item => typeof item !== 'string' || !item.trim())) {
+    datasetSchemaError(`${field} must be an array of non-empty strings.`);
+  }
+  return [...new Set(value.map(item => item.trim()))];
+}
+
+function datasetAttributeName(value, field) {
+  const name = datasetString(value, field, { required: true, max: 128 });
+  if (!DATASET_ATTRIBUTE_NAME_PATTERN.test(name)) {
+    datasetSchemaError(`${field} must start with a letter or underscore and contain only letters, numbers, "_", "-", or ".".`);
+  }
+  return name;
+}
+
+function normalizeDatasetNativeType(type, field) {
+  const value = datasetString(type || 'string', field, { required: true, max: 40 }).toLowerCase();
+  const aliases = {
+    text: 'string',
+    integer: 'number',
+    int: 'number',
+    float: 'number',
+    double: 'number',
+    url: 'string',
+    email: 'string',
+    date: 'string',
+    datetime: 'string',
+  };
+  const normalized = aliases[value] || value;
+  if (!['string', 'number', 'boolean', 'object'].includes(normalized)) {
+    datasetSchemaError(`${field} has unsupported type "${value}".`);
+  }
+  return normalized;
+}
+
+function normalizeDatasetFormat(format) {
+  if (!format) return null;
+  const known = {
+    'date-time': 'ISO 8601 date and time',
+    date: 'ISO 8601 date (YYYY-MM-DD)',
+    email: 'Valid email address',
+    uri: 'Absolute URL',
+    url: 'Absolute URL',
+    hostname: 'DNS hostname',
+    ipv4: 'IPv4 address',
+    ipv6: 'IPv6 address',
+    uuid: 'UUID',
+  };
+  return known[String(format).toLowerCase()] || `JSON Schema format: ${String(format).slice(0, 120)}`;
+}
+
+function normalizeNativeDatasetSchema(schema) {
+  const entityObject = schema.entity && typeof schema.entity === 'object' && !Array.isArray(schema.entity)
+    ? schema.entity
+    : {};
+  const entityName = datasetString(
+    entityObject.name || schema.entity_name,
+    'schema.entity.name',
+    { required: true, max: 160 },
+  );
+  const entityDescription = datasetString(
+    entityObject.description ?? schema.entity_description ?? '',
+    'schema.entity.description',
+    { max: 4000 },
+  );
+  const criteria = datasetStringArray(
+    entityObject.criteria ?? schema.entity_criteria ?? [],
+    'schema.entity.criteria',
+  );
+  if (!Array.isArray(schema.attributes) || schema.attributes.length === 0) {
+    datasetSchemaError('schema.attributes must contain at least one attribute.');
+  }
+  if (schema.attributes.length > MAX_DATASET_ATTRIBUTES) {
+    datasetSchemaError(`schema.attributes cannot contain more than ${MAX_DATASET_ATTRIBUTES} attributes.`);
+  }
+
+  const seen = new Set();
+  const attributes = schema.attributes.map((attribute, index) => {
+    if (!attribute || typeof attribute !== 'object' || Array.isArray(attribute)) {
+      datasetSchemaError(`schema.attributes[${index}] must be an object.`);
+    }
+    const name = datasetAttributeName(attribute.name, `schema.attributes[${index}].name`);
+    if (seen.has(name)) datasetSchemaError(`schema.attributes contains duplicate name "${name}".`);
+    seen.add(name);
+    const isArray = attribute.is_array === true || String(attribute.type || '').toLowerCase() === 'array';
+    const rawType = isArray
+      ? (attribute.items?.type || attribute.item_type || 'string')
+      : (attribute.type || 'string');
+    return {
+      name,
+      description: datasetString(
+        attribute.description || '',
+        `schema.attributes[${index}].description`,
+        { max: 2000 },
+      ),
+      type: normalizeDatasetNativeType(rawType, `schema.attributes[${index}].type`),
+      is_array: isArray,
+      is_primary: attribute.is_primary === true,
+      required: attribute.required === true || attribute.is_primary === true,
+      standard_format: datasetString(
+        attribute.standard_format || normalizeDatasetFormat(attribute.format) || '',
+        `schema.attributes[${index}].standard_format`,
+        { max: 500 },
+      ) || null,
+      action: 'add',
+    };
+  });
+  if (!attributes.some(attribute => attribute.is_primary)) {
+    datasetSchemaError(
+      'Native schema must mark at least one attribute with is_primary: true.',
+      'Mark the stable entity identifier field with is_primary: true.',
+    );
+  }
+  return {
+    entity: { name: entityName, description: entityDescription, criteria },
+    entity_name: entityName,
+    entity_description: entityDescription,
+    entity_criteria: criteria,
+    attributes,
+  };
+}
+
+function datasetPropertyType(property, field) {
+  const rawType = Array.isArray(property.type)
+    ? property.type.find(type => type !== 'null')
+    : property.type;
+  if (!rawType || !DATASET_JSON_TYPES.has(rawType)) {
+    datasetSchemaError(`${field}.type must be one of string, number, integer, boolean, array, or object.`);
+  }
+  if (rawType === 'array') {
+    const itemType = Array.isArray(property.items?.type)
+      ? property.items.type.find(type => type !== 'null')
+      : property.items?.type;
+    if (!itemType || !DATASET_JSON_TYPES.has(itemType) || itemType === 'array') {
+      datasetSchemaError(`${field}.items.type is required for arrays and cannot itself be an array.`);
+    }
+    return { type: normalizeDatasetNativeType(itemType, `${field}.items.type`), isArray: true };
+  }
+  return { type: normalizeDatasetNativeType(rawType, `${field}.type`), isArray: false };
+}
+
+function normalizeObjectDatasetSchema(schema) {
+  if (schema.type !== 'object') datasetSchemaError('JSON Schema root type must be "object".');
+  if (!schema.properties || typeof schema.properties !== 'object' || Array.isArray(schema.properties)) {
+    datasetSchemaError('JSON Schema properties must be a non-empty object.');
+  }
+  const entries = Object.entries(schema.properties);
+  if (entries.length === 0) datasetSchemaError('JSON Schema properties must be a non-empty object.');
+  if (entries.length > MAX_DATASET_ATTRIBUTES) {
+    datasetSchemaError(`JSON Schema cannot contain more than ${MAX_DATASET_ATTRIBUTES} properties.`);
+  }
+  const required = new Set(datasetStringArray(schema.required || [], 'schema.required'));
+  for (const requiredName of required) {
+    if (!Object.hasOwn(schema.properties, requiredName)) {
+      datasetSchemaError(`schema.required references unknown property "${requiredName}".`);
+    }
+  }
+  const declaredPrimary = datasetStringArray(
+    schema['x-webhound-primary-key'] == null
+      ? []
+      : (Array.isArray(schema['x-webhound-primary-key'])
+        ? schema['x-webhound-primary-key']
+        : [schema['x-webhound-primary-key']]),
+    'schema.x-webhound-primary-key',
+  );
+  for (const primaryName of declaredPrimary) {
+    if (!Object.hasOwn(schema.properties, primaryName)) {
+      datasetSchemaError(`schema.x-webhound-primary-key references unknown property "${primaryName}".`);
+    }
+  }
+  const propertyPrimary = entries
+    .filter(([, property]) => property?.['x-webhound-primary'] === true)
+    .map(([name]) => name);
+  let primaryNames = [...new Set([...declaredPrimary, ...propertyPrimary])];
+  if (primaryNames.length === 0) {
+    primaryNames = [entries.find(([name]) => required.has(name))?.[0] || entries[0][0]];
+  }
+  const primarySet = new Set(primaryNames);
+  const attributes = entries.map(([rawName, property], index) => {
+    const name = datasetAttributeName(rawName, `schema.properties key ${index}`);
+    if (!property || typeof property !== 'object' || Array.isArray(property)) {
+      datasetSchemaError(`schema.properties.${name} must be an object.`);
+    }
+    const resolved = datasetPropertyType(property, `schema.properties.${name}`);
+    return {
+      name,
+      description: datasetString(
+        property.description || property.title || '',
+        `schema.properties.${name}.description`,
+        { max: 2000 },
+      ),
+      type: resolved.type,
+      is_array: resolved.isArray,
+      is_primary: primarySet.has(name),
+      required: required.has(name) || primarySet.has(name),
+      standard_format: datasetString(
+        normalizeDatasetFormat(property.format) || '',
+        `schema.properties.${name}.format`,
+        { max: 500 },
+      ) || null,
+      action: 'add',
+    };
+  });
+  const entityName = datasetString(schema.title || 'Extracted entity', 'schema.title', { required: true, max: 160 });
+  const entityDescription = datasetString(schema.description || '', 'schema.description', { max: 4000 });
+  return {
+    entity: { name: entityName, description: entityDescription, criteria: [] },
+    entity_name: entityName,
+    entity_description: entityDescription,
+    entity_criteria: [],
+    attributes,
+  };
 }
 
 export function normalizeDatasetSchema(schema) {
   if (schema === undefined || schema === null) return undefined;
   if (!schema || typeof schema !== 'object' || Array.isArray(schema)) {
-    throw webhoundError('Dataset schema must be either a native Webhound schema or an object JSON Schema.', {
-      code: 'INVALID_DATASET_SCHEMA',
-      status: 400,
-      retryable: false,
-    });
+    datasetSchemaError('Dataset schema must be either a native Webhound schema or an object JSON Schema.');
   }
-
-  if (Array.isArray(schema.attributes)) {
-    if (schema.attributes.length === 0) {
-      throw webhoundError('Native dataset schema attributes must contain at least one field.', {
-        code: 'INVALID_DATASET_SCHEMA',
-        status: 400,
-        retryable: false,
-      });
-    }
-    if (schema.attributes.length > 200) {
-      throw webhoundError('Native dataset schemas support at most 200 attributes.', {
-        code: 'INVALID_DATASET_SCHEMA',
-        status: 400,
-        retryable: false,
-      });
-    }
-    const attributes = schema.attributes.map((attribute) => {
-      if (attribute.type === 'array') {
-        throw webhoundError(`Native attribute "${attribute.name}" cannot use type: "array".`, {
-          code: 'INVALID_DATASET_SCHEMA',
-          status: 400,
-          retryable: false,
-          nextAction: 'Use the scalar item type and set is_array: true.',
-        });
-      }
-      return {
-        name: String(attribute.name).trim(),
-        description: attribute.description ? String(attribute.description) : undefined,
-        type: normalizeAttributeType(attribute.type),
-        is_array: attribute.is_array === true,
-        is_primary: attribute.is_primary === true,
-        standard_format: attribute.standard_format ? String(attribute.standard_format) : undefined,
-      };
-    });
-    if (!attributes.some(attribute => attribute.is_primary)) {
-      throw webhoundError('Native dataset schema must mark at least one attribute with is_primary: true.', {
-        code: 'INVALID_DATASET_SCHEMA',
-        status: 400,
-        retryable: false,
-        nextAction: 'Mark the stable entity identifier field with is_primary: true.',
-      });
-    }
-    return {
-      entity_name: String(schema.entity_name || schema.entity?.name || 'Entity').trim(),
-      entity_description: schema.entity_description || schema.entity?.description || undefined,
-      entity_criteria: schema.entity_criteria || schema.entity?.criteria || undefined,
-      attributes,
-    };
+  if (schema.type === 'object' || schema.properties !== undefined || schema.$schema) {
+    return normalizeObjectDatasetSchema(schema);
   }
-
-  if (schema.type !== 'object' || !schema.properties || typeof schema.properties !== 'object' || Array.isArray(schema.properties)) {
-    throw webhoundError('JSON Schema datasets require type: "object" and a non-empty properties object.', {
-      code: 'INVALID_DATASET_SCHEMA',
-      status: 400,
-      retryable: false,
-    });
-  }
-  const entries = Object.entries(schema.properties);
-  if (entries.length === 0) {
-    throw webhoundError('JSON Schema properties must contain at least one field.', {
-      code: 'INVALID_DATASET_SCHEMA',
-      status: 400,
-      retryable: false,
-    });
-  }
-  if (entries.length > 200) {
-    throw webhoundError('Object JSON Schemas support at most 200 properties.', {
-      code: 'INVALID_DATASET_SCHEMA',
-      status: 400,
-      retryable: false,
-    });
-  }
-  const explicitPrimary = entries.find(([, property]) => (
-    property?.['x-webhound-primary'] === true || property?.['x-primary-key'] === true
-  ))?.[0];
-  const required = Array.isArray(schema.required) ? schema.required : [];
-  const primaryName = explicitPrimary || required.find(name => Object.hasOwn(schema.properties, name)) || entries[0][0];
-  return {
-    entity_name: String(schema.title || 'Entity').trim(),
-    entity_description: schema.description ? String(schema.description) : undefined,
-    attributes: entries.map(([name, property = {}]) => {
-      const rawType = Array.isArray(property.type) ? property.type.find(item => item !== 'null') : property.type;
-      const itemType = rawType === 'array' ? property.items?.type : rawType;
-      return {
-        name,
-        description: property.description ? String(property.description) : undefined,
-        type: normalizeAttributeType(itemType),
-        is_array: rawType === 'array',
-        is_primary: name === primaryName,
-        standard_format: property.format ? String(property.format) : undefined,
-      };
-    }),
-  };
+  return normalizeNativeDatasetSchema(schema);
 }
 
 export class WebhoundApiClient {
@@ -899,6 +1447,7 @@ export class WebhoundApiClient {
     const data = await this.get(`/sessions/${encodeURIComponent(sessionId)}/claims`);
     const claims = Array.isArray(data?.claims) ? data.claims : [];
     if (claims.length > 0) {
+      const count = Number(data.claim_count ?? data.count ?? data.total ?? claims.length);
       return {
         ...data,
         claims: claims.map((claim, index) => {
@@ -910,6 +1459,8 @@ export class WebhoundApiClient {
             session_id: sessionId,
           };
         }),
+        claim_count: Number.isFinite(count) ? count : claims.length,
+        total: Number.isFinite(count) ? count : claims.length,
       };
     }
     const full = await this.getSession(sessionId);
@@ -918,6 +1469,7 @@ export class WebhoundApiClient {
     return {
       ...data,
       claims: cellClaims,
+      claim_count: cellClaims.length,
       total: cellClaims.length,
       provenance_level: 'dataset_cell',
     };
@@ -926,7 +1478,14 @@ export class WebhoundApiClient {
   async getSources(sessionId) {
     const data = await this.get(`/sessions/${encodeURIComponent(sessionId)}/sources`);
     const sources = Array.isArray(data?.sources) ? data.sources : [];
-    if (sources.length > 0) return data;
+    if (sources.length > 0) {
+      const count = Number(data.source_count ?? data.count ?? data.total ?? sources.length);
+      return {
+        ...data,
+        source_count: Number.isFinite(count) ? count : sources.length,
+        total: Number.isFinite(count) ? count : sources.length,
+      };
+    }
     const full = await this.getSession(sessionId);
     if (sessionKind(full) !== 'dataset') return data;
     const counts = new Map();
@@ -943,6 +1502,7 @@ export class WebhoundApiClient {
     return {
       ...data,
       sources: aggregated,
+      source_count: aggregated.length,
       total: aggregated.length,
       provenance_level: 'dataset_cell',
     };
@@ -1025,6 +1585,11 @@ export class WebhoundApiClient {
     const fileName = requestedFileName || safeUploadFilename('webhound-input', mimeType);
     assertMimeMatchesBytes(bytes, mimeType);
     form.append('file', new Blob([bytes], { type: mimeType }), fileName);
-    return this.request('POST', '/files/upload', form);
+    const data = await this.request('POST', '/files/upload', form);
+    return {
+      ...data,
+      file_name: data.file_name || data.filename || fileName,
+      size_bytes: Number(data.size_bytes ?? data.size ?? bytes.length),
+    };
   }
 }
