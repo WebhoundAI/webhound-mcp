@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "canonical_source": "Slingshot-Innovation/webhound-server:mcp",
+  "package_version": "0.5.0",
+  "files": {
+    "bin/server.mjs": "acc717cc2cb3b0f9a2927cea3e84ba09a4597d23c606f1203a2b2088161b542d",
+    "core/http.mjs": "c66d63c6ad630962b1f782ce5cdd853b39d5aa4e681e138c88ebe22af45a0c3d",
+    "core/server.mjs": "655cb1737cf3eae6a5bd5b0f217099bccfa00ead4fad8162fcea840ea686d64b",
+    "core/webhoundClient.mjs": "2c0c2bf4ebd7846bdf37f641b1a1e19c3699d62ec37fd4ae7553f84d98061145"
+  }
+}

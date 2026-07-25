@@ -1,10 +1,20 @@
+import { lookup } from 'node:dns/promises';
+import { isIP } from 'node:net';
 import { McpServer, ResourceTemplate } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
-import { WebhoundApiClient, stripHtml } from './webhoundClient.mjs';
+import {
+  WebhoundApiClient,
+  safeUploadFilename,
+  stripHtml,
+  validateUploadMimeType,
+  webhoundError,
+} from './webhoundClient.mjs';
 
-export const VERSION = '0.4.3';
+export const VERSION = '0.5.0';
 const BILLING_URL = 'https://www.webhound.ai/billing';
 const MCP_RESOURCE_METADATA_URL = process.env.WEBHOUND_MCP_RESOURCE_METADATA_URL || 'https://api.webhound.ai/.well-known/oauth-protected-resource';
+const STRUCTURED_CONTENT_VERSION = 'webhound-mcp-0.5';
+const MAX_UPLOAD_BYTES = 50 * 1024 * 1024;
 
 export const TOOL_NAMES = Object.freeze([
   'webhound_health',
@@ -66,7 +76,7 @@ Defaults exist so agents do not waste user time asking about implementation choi
 
 If you are helping a user install local stdio MCP, tell them to restart the agent session or open a new one after saving config if Webhound tools do not appear. Many clients load MCP servers only when a session starts.
 
-If the user asks to run Webhound onboarding, call webhound_onboarding and follow the returned agent_playbook. That tool includes account state, defaults, free-run status, billing readiness, suggested workspace rules, and the recommended first-run path. Onboarding should ask before the first run whether the user wants local workspace setup first or wants to jump right into the first run. If they choose setup first, complete the local setup flow before starting the run. If they jump right in, start the run, then offer setup while Webhound works.
+If the user asks to run Webhound onboarding, call webhound_onboarding with the current client when known and follow its compact next_action one step at a time. Hosted clients must not create or edit workspace rules unless the user explicitly requests that separate action. Starting research must never implicitly trigger workspace-rule setup.
 
 If the user asks how Webhound works, call webhound_help with the closest topic and explain only the relevant part. If the user wants to remove Webhound from their agent, call webhound_uninstall; it gives removal guidance but does not revoke keys automatically.
 
@@ -189,9 +199,11 @@ function completeToolConfig(name, config = {}) {
   const existingAnnotations = config.annotations || {};
   const readOnly = existingAnnotations.readOnlyHint === true;
   const securitySchemes = config.securitySchemes || WEBHOUND_OAUTH_SCHEMES;
+  const outputSchema = config.outputSchema || TOOL_OUTPUT_SCHEMAS[name];
+  if (!outputSchema) throw new Error(`Missing dedicated output schema for ${name}`);
   return {
     ...config,
-    outputSchema: config.outputSchema || z.object({}).passthrough(),
+    outputSchema,
     securitySchemes,
     annotations: {
       readOnlyHint: readOnly,
@@ -206,6 +218,403 @@ function completeToolConfig(name, config = {}) {
     },
   };
 }
+
+const ERROR_DETAIL_SCHEMA = z.object({
+  code: z.string(),
+  message: z.string(),
+  status: z.number().int().nullable(),
+  retryable: z.boolean(),
+  next_action: z.string().nullable(),
+}).strict();
+
+const COMMON_OUTPUT_FIELDS = Object.freeze({
+  ok: z.boolean(),
+  schema_version: z.literal(STRUCTURED_CONTENT_VERSION),
+  summary: z.string(),
+  tool: z.string(),
+  code: z.string().optional(),
+  message: z.string().optional(),
+  status: z.union([z.number().int(), z.string()]).nullable().optional(),
+  retryable: z.boolean().optional(),
+  next_action: z.string().nullable().optional(),
+  next_actions: z.array(z.string()).optional(),
+  error_details: ERROR_DETAIL_SCHEMA.optional(),
+  blocked: z.boolean().optional(),
+  session_started: z.boolean().optional(),
+  billing_url: z.string().url().nullable().optional(),
+  user_message_template: z.string().optional(),
+  retry_after_user_confirms: z.record(z.string(), z.unknown()).optional(),
+  error: z.unknown().optional(),
+  no_spend: z.boolean().optional(),
+  action_started: z.boolean().optional(),
+  original_tool: z.string().optional(),
+  top_up_url: z.string().optional(),
+  required: z.number().optional(),
+  current_balance: z.number().optional(),
+  auto_recharge_enabled: z.boolean().optional(),
+  api_message: z.unknown().optional(),
+  data: z.unknown().optional(),
+});
+
+const FLEX_OBJECT = z.record(z.string(), z.unknown());
+const FLEX_ARRAY = z.array(z.unknown());
+const SESSION_OUTPUT_FIELDS = Object.freeze({
+  session_id: z.string().optional(),
+  product: z.string().optional(),
+  kind: z.string().optional(),
+  session_type: z.string().optional(),
+  name: z.string().optional(),
+  status: z.union([z.number().int(), z.string()]).nullable().optional(),
+  done: z.boolean().optional(),
+  output_ready: z.boolean().optional(),
+  is_running: z.boolean().optional(),
+  healthy: z.boolean().optional(),
+  successful_completion: z.boolean().optional(),
+  completion_state: z.string().optional(),
+  completion_reason: z.string().nullable().optional(),
+  budget: z.number().optional(),
+  cost: z.number().optional(),
+  credit_limit: z.number().optional(),
+  total_spent: z.number().optional(),
+  research_harness: z.string().optional(),
+  url: z.string().optional(),
+  alerts: FLEX_ARRAY.optional(),
+  activity: FLEX_OBJECT.optional(),
+  documents: z.unknown().optional(),
+  dataset: FLEX_OBJECT.optional(),
+  agents: FLEX_OBJECT.optional(),
+  status_snapshot: FLEX_OBJECT.optional(),
+  budget_control: FLEX_OBJECT.optional(),
+  runtime_estimate: FLEX_OBJECT.optional(),
+  followup_check_in: FLEX_OBJECT.optional(),
+  sidecar_guidance: FLEX_OBJECT.optional(),
+  free_run: FLEX_OBJECT.optional(),
+  resumed: z.boolean().optional(),
+  guidance_added: z.boolean().optional(),
+  stopped: z.boolean().optional(),
+  amount_added: z.number().optional(),
+  previous_budget: z.number().optional(),
+  current_budget: z.number().optional(),
+  new_budget: z.number().optional(),
+  current_spend: z.number().optional(),
+  assembly_triggered: z.boolean().optional(),
+  message_id: z.string().optional(),
+  accepted: z.boolean().optional(),
+  mcp_next_action: z.string().optional(),
+  agent_instruction: z.union([z.string(), z.array(z.string())]).optional(),
+  forbidden_next_tools: z.array(z.string()).optional(),
+});
+
+function toolOutputSchema(name, fields = {}) {
+  return z.object({
+    ...COMMON_OUTPUT_FIELDS,
+    tool: z.literal(name),
+    ...fields,
+  }).strict();
+}
+
+const TOOL_OUTPUT_SCHEMAS = Object.freeze({
+  webhound_health: toolOutputSchema('webhound_health', {
+    mcp_ready: z.boolean().optional(),
+    api_reachable: z.boolean().optional(),
+    authenticated: z.boolean().optional(),
+    services: FLEX_OBJECT.optional(),
+    errors: FLEX_ARRAY.optional(),
+    health: FLEX_OBJECT.nullable().optional(),
+    credits: z.unknown().optional(),
+    defaults: FLEX_OBJECT.optional(),
+    free_run: FLEX_OBJECT.optional(),
+    account: FLEX_OBJECT.optional(),
+    mcp: FLEX_OBJECT.optional(),
+  }),
+  webhound_onboarding: toolOutputSchema('webhound_onboarding', {
+    flow_id: z.string().optional(),
+    flow_version: z.literal(1).optional(),
+    client: z.string().optional(),
+    client_mode: z.string().optional(),
+    step: z.string().optional(),
+    message: z.string().optional(),
+    choices: FLEX_ARRAY.optional(),
+    next_action: z.string().optional(),
+    workspace_rules: FLEX_OBJECT.optional(),
+    account_state: FLEX_OBJECT.optional(),
+    free_run: FLEX_OBJECT.optional(),
+    billing: FLEX_OBJECT.optional(),
+    recommended_defaults: FLEX_OBJECT.optional(),
+  }),
+  webhound_help: toolOutputSchema('webhound_help', {
+    topic: z.string().optional(),
+    requested_topic: z.string().nullable().optional(),
+    question: z.string().nullable().optional(),
+    answer: z.string().optional(),
+    no_spend: z.boolean().optional(),
+    related_tools: z.array(z.string()).optional(),
+    agent_behavior_rules: z.array(z.string()).optional(),
+    common_mistakes: z.array(z.string()).optional(),
+    suggested_user_facing_wording: z.string().optional(),
+    examples: FLEX_ARRAY.optional(),
+    related_topics: z.array(z.string()).optional(),
+  }),
+  webhound_uninstall: toolOutputSchema('webhound_uninstall', {
+    client: z.string().optional(),
+    client_label: z.string().optional(),
+    no_spend: z.boolean().optional(),
+    guidance_only: z.boolean().optional(),
+    revokes_key: z.boolean().optional(),
+    steps: z.array(z.string()).optional(),
+    likely_rule_locations: z.array(z.string()).optional(),
+    key_revocation_note: z.string().optional(),
+    suggested_user_facing_wording: z.string().optional(),
+  }),
+  webhound_get_defaults: toolOutputSchema('webhound_get_defaults', {
+    default_budget_usd: z.number().optional(),
+    default_product: z.string().optional(),
+    use_free_run_when_available: z.boolean().optional(),
+    research_harness: z.string().optional(),
+  }),
+  webhound_set_defaults: toolOutputSchema('webhound_set_defaults', {
+    default_budget_usd: z.number().optional(),
+    default_product: z.string().optional(),
+    use_free_run_when_available: z.boolean().optional(),
+    research_harness: z.string().optional(),
+  }),
+  webhound_start_report: toolOutputSchema('webhound_start_report', {
+    ...SESSION_OUTPUT_FIELDS,
+  }),
+  webhound_start_dataset: toolOutputSchema('webhound_start_dataset', {
+    ...SESSION_OUTPUT_FIELDS,
+    normalized_schema: FLEX_OBJECT.nullable().optional(),
+    schema_source: z.enum(['webhound_native', 'json_schema', 'inferred']).optional(),
+  }),
+  webhound_watch: toolOutputSchema('webhound_watch', {
+    ...SESSION_OUTPUT_FIELDS,
+  }),
+  webhound_wait: toolOutputSchema('webhound_wait', {
+    ...SESSION_OUTPUT_FIELDS,
+    still_running: z.boolean().optional(),
+    action_required: z.boolean().optional(),
+    polling: FLEX_OBJECT.optional(),
+  }),
+  webhound_add_sidecar_notes: toolOutputSchema('webhound_add_sidecar_notes', {
+    session_id: z.string().optional(),
+    count: z.number().int().optional(),
+    notes: FLEX_ARRAY.optional(),
+    saved: FLEX_ARRAY.optional(),
+    skipped: FLEX_ARRAY.optional(),
+    note: z.string().optional(),
+    status: z.string().optional(),
+    no_spend: z.boolean().optional(),
+    interrupting: z.boolean().optional(),
+  }),
+  webhound_list_sidecar_notes: toolOutputSchema('webhound_list_sidecar_notes', {
+    session_id: z.string().optional(),
+    count: z.number().int().optional(),
+    notes: FLEX_ARRAY.optional(),
+    no_spend: z.boolean().optional(),
+    interrupting: z.boolean().optional(),
+  }),
+  webhound_update_sidecar_note: toolOutputSchema('webhound_update_sidecar_note', {
+    session_id: z.string().optional(),
+    updated: z.boolean().optional(),
+    note: FLEX_OBJECT.optional(),
+    no_spend: z.boolean().optional(),
+    interrupting: z.boolean().optional(),
+  }),
+  webhound_send_message: toolOutputSchema('webhound_send_message', {
+    ...SESSION_OUTPUT_FIELDS,
+    reason: z.string().optional(),
+    resumes_session: z.boolean().optional(),
+    interrupting: z.boolean().optional(),
+  }),
+  webhound_stop: toolOutputSchema('webhound_stop', {
+    ...SESSION_OUTPUT_FIELDS,
+  }),
+  webhound_resume: toolOutputSchema('webhound_resume', {
+    ...SESSION_OUTPUT_FIELDS,
+    additional_budget: z.number().optional(),
+  }),
+  webhound_add_budget: toolOutputSchema('webhound_add_budget', {
+    ...SESSION_OUTPUT_FIELDS,
+    amount: z.number().optional(),
+  }),
+  webhound_set_budget: toolOutputSchema('webhound_set_budget', {
+    ...SESSION_OUTPUT_FIELDS,
+    target_budget: z.number().optional(),
+    completion_contract: z.string().optional(),
+  }),
+  webhound_get_output: toolOutputSchema('webhound_get_output', {
+    ...SESSION_OUTPUT_FIELDS,
+    complete_output: z.boolean().optional(),
+    requested_kind: z.string().optional(),
+    actual_kind: z.string().nullable().optional(),
+    artifact: FLEX_OBJECT.optional(),
+    content_markdown: z.string().optional(),
+    rows: FLEX_ARRAY.optional(),
+    total_rows: z.number().int().optional(),
+    schema: FLEX_OBJECT.optional(),
+    documents: FLEX_ARRAY.optional(),
+    document_id: z.string().optional(),
+    document_state: z.string().optional(),
+    selection_key: z.string().optional(),
+    truncated: z.boolean().optional(),
+    omitted: z.array(z.string()).optional(),
+    output_deferred_until_done: z.boolean().optional(),
+    evidence_pack_instruction: z.string().optional(),
+    next_research_instruction: z.string().optional(),
+  }),
+  webhound_export_session: toolOutputSchema('webhound_export_session', {
+    ...SESSION_OUTPUT_FIELDS,
+    complete_export: z.boolean().optional(),
+    delivery: z.enum(['inline_text', 'inline_base64', 'download_url', 'none']).optional(),
+    filename: z.string().optional(),
+    format: z.string().optional(),
+    mime_type: z.string().optional(),
+    encoding: z.string().optional(),
+    size_bytes: z.number().int().optional(),
+    content: z.string().optional(),
+    content_base64: z.string().optional(),
+    download_url: z.string().optional(),
+    download_note: z.string().optional(),
+    binary_download_url: z.string().optional(),
+    content_truncated: z.boolean().optional(),
+    omitted: z.array(z.string()).optional(),
+    export_deferred_until_done: z.boolean().optional(),
+    evidence_pack_instruction: z.string().optional(),
+    next_research_instruction: z.string().optional(),
+  }),
+  webhound_get_evidence_pack: toolOutputSchema('webhound_get_evidence_pack', {
+    ...SESSION_OUTPUT_FIELDS,
+    complete_evidence_pack: z.boolean().optional(),
+    complete_session: z.boolean().optional(),
+    truncated: z.boolean().optional(),
+    omitted: z.array(z.string()).optional(),
+    session: FLEX_OBJECT.optional(),
+    metadata: FLEX_OBJECT.optional(),
+    documents: FLEX_ARRAY.optional(),
+    working_docs: FLEX_ARRAY.optional(),
+    output: z.unknown().optional(),
+    content_markdown: z.string().optional(),
+    dataset: FLEX_OBJECT.optional(),
+    evidence: FLEX_OBJECT.optional(),
+    claims: FLEX_ARRAY.optional(),
+    sources: FLEX_ARRAY.optional(),
+    research_agents: FLEX_ARRAY.optional(),
+    usage: FLEX_OBJECT.optional(),
+    messages: FLEX_ARRAY.optional(),
+    phase_summaries: FLEX_ARRAY.optional(),
+    tasks: FLEX_OBJECT.optional(),
+    research_state: FLEX_OBJECT.optional(),
+    notepad: z.unknown().optional(),
+    sidecar_notes: FLEX_ARRAY.optional(),
+    diagnostics: FLEX_OBJECT.optional(),
+    artifacts: FLEX_OBJECT.optional(),
+    session_revision: z.union([z.string(), z.number()]).optional(),
+    content_hash: z.string().optional(),
+    exports: FLEX_OBJECT.optional(),
+    excluded_by_request: z.array(z.string()).optional(),
+    requested_kind: z.string().optional(),
+    actual_kind: z.string().nullable().optional(),
+    artifact: FLEX_OBJECT.optional(),
+    evidence_pack_instruction: z.string().optional(),
+    next_research_instruction: z.string().optional(),
+    evidence_pack_deferred_until_done: z.boolean().optional(),
+  }),
+  webhound_get_shareable_link: toolOutputSchema('webhound_get_shareable_link', {
+    session_id: z.string().optional(),
+    session_type: z.string().optional(),
+    share_url: z.string().optional(),
+    public_url: z.string().optional(),
+    artifact_type: z.string().optional(),
+    is_public: z.boolean().optional(),
+    noindex: z.boolean().optional(),
+    publication_id: z.string().nullable().optional(),
+    publication_url: z.string().nullable().optional(),
+    no_spend: z.boolean().optional(),
+    share_only: z.boolean().optional(),
+    public_to_anyone_with_link: z.boolean().optional(),
+    explore_published: z.boolean().optional(),
+  }),
+  webhound_get_claims: toolOutputSchema('webhound_get_claims', {
+    session_id: z.string().optional(),
+    claims: FLEX_ARRAY.optional(),
+    claim_count: z.number().int().optional(),
+    total: z.number().int().optional(),
+    provenance_level: z.string().optional(),
+    sources: FLEX_ARRAY.optional(),
+  }),
+  webhound_get_sources: toolOutputSchema('webhound_get_sources', {
+    session_id: z.string().optional(),
+    sources: FLEX_ARRAY.optional(),
+    source_count: z.number().int().optional(),
+    total: z.number().int().optional(),
+    provenance_level: z.string().optional(),
+    claims: FLEX_ARRAY.optional(),
+  }),
+  webhound_search_sessions: toolOutputSchema('webhound_search_sessions', {
+    query: z.string().optional(),
+    sessions: FLEX_ARRAY.optional(),
+    results: FLEX_ARRAY.optional(),
+    count: z.number().int().optional(),
+    total: z.number().int().optional(),
+  }),
+  webhound_list_sessions: toolOutputSchema('webhound_list_sessions', {
+    sessions: FLEX_ARRAY.optional(),
+    count: z.number().int().optional(),
+    total: z.number().int().optional(),
+    page: z.number().int().optional(),
+    limit: z.number().int().optional(),
+    has_more: z.boolean().optional(),
+  }),
+  webhound_get_session: toolOutputSchema('webhound_get_session', {
+    ...SESSION_OUTPUT_FIELDS,
+    complete_session: z.boolean().optional(),
+    truncated: z.boolean().optional(),
+    omitted: z.array(z.string()).optional(),
+    session: FLEX_OBJECT.optional(),
+    metadata: FLEX_OBJECT.optional(),
+    messages: FLEX_ARRAY.optional(),
+    phase_summaries: FLEX_ARRAY.optional(),
+    tasks: FLEX_OBJECT.optional(),
+    research_state: FLEX_OBJECT.optional(),
+    research_agents: FLEX_ARRAY.optional(),
+    documents: FLEX_ARRAY.optional(),
+    dataset: FLEX_OBJECT.optional(),
+    evidence: FLEX_OBJECT.optional(),
+    usage: FLEX_OBJECT.optional(),
+    notes: FLEX_ARRAY.optional(),
+    diagnostics: FLEX_OBJECT.optional(),
+    artifact_links: FLEX_OBJECT.optional(),
+    notepad: z.unknown().optional(),
+    sidecar_notes: FLEX_ARRAY.optional(),
+    artifacts: FLEX_OBJECT.optional(),
+    session_revision: z.union([z.string(), z.number()]).optional(),
+    content_hash: z.string().optional(),
+    content_markdown: z.string().optional(),
+  }),
+  webhound_upload_file: toolOutputSchema('webhound_upload_file', {
+    file_id: z.string().optional(),
+    id: z.string().optional(),
+    file_name: z.string().optional(),
+    mime_type: z.string().optional(),
+    size_bytes: z.number().int().optional(),
+    files: FLEX_ARRAY.optional(),
+    file_ids: z.array(z.string()).optional(),
+  }),
+  webhound_account: toolOutputSchema('webhound_account', {
+    authenticated: z.boolean().optional(),
+    credits: z.unknown().optional(),
+    usage: FLEX_OBJECT.optional(),
+    free_run: FLEX_OBJECT.optional(),
+    defaults: FLEX_OBJECT.optional(),
+    billing: FLEX_OBJECT.optional(),
+    research_harness: z.string().optional(),
+    can_start_default_paid_run: z.boolean().optional(),
+    billing_configured_for_uninterrupted_runs: z.boolean().optional(),
+  }),
+  webhound_diagnose: toolOutputSchema('webhound_diagnose', {
+    ...SESSION_OUTPUT_FIELDS,
+  }),
+});
 
 function truncateText(value, maxChars) {
   const text = String(value || '');
@@ -262,11 +671,246 @@ function summarizeTraceExport(raw, maxChars = 60000, maxTraces = 1000) {
 }
 
 const CHATGPT_FILE_SCHEMA = z.object({
-  download_url: z.string().url(),
+  download_url: z.string().url().refine(value => value.startsWith('https://'), 'Attachment download_url must use HTTPS.'),
   file_id: z.string(),
   mime_type: z.string().optional(),
   file_name: z.string().optional(),
 }).passthrough();
+const DATASET_ATTRIBUTE_SCHEMA = z.object({
+  name: z.string().min(1).max(120),
+  description: z.string().max(1000).optional(),
+  type: z.enum(['string', 'number', 'integer', 'boolean', 'object']).default('string'),
+  is_array: z.boolean().default(false),
+  is_primary: z.boolean().default(false),
+  standard_format: z.string().max(120).optional(),
+}).strict();
+const NATIVE_DATASET_SCHEMA = z.object({
+  entity_name: z.string().min(1).max(200).optional(),
+  entity_description: z.string().max(2000).optional(),
+  entity_criteria: z.array(z.string().max(500)).max(30).optional(),
+  entity: z.object({
+    name: z.string().min(1).max(200).optional(),
+    description: z.string().max(2000).optional(),
+    criteria: z.array(z.string().max(500)).max(30).optional(),
+  }).strict().optional(),
+  attributes: z.array(DATASET_ATTRIBUTE_SCHEMA).min(1).max(200),
+}).strict().superRefine((schema, context) => {
+  const names = schema.attributes.map(attribute => attribute.name);
+  if (new Set(names).size !== names.length) {
+    context.addIssue({ code: z.ZodIssueCode.custom, message: 'Dataset attribute names must be unique.', path: ['attributes'] });
+  }
+  if (!schema.attributes.some(attribute => attribute.is_primary)) {
+    context.addIssue({ code: z.ZodIssueCode.custom, message: 'At least one native attribute must have is_primary: true.', path: ['attributes'] });
+  }
+});
+const JSON_SCHEMA_PROPERTY = z.object({
+  type: z.union([
+    z.enum(['string', 'number', 'integer', 'boolean', 'object', 'array']),
+    z.array(z.enum(['string', 'number', 'integer', 'boolean', 'object', 'array', 'null'])).min(1),
+  ]).optional(),
+  description: z.string().max(1000).optional(),
+  format: z.string().max(120).optional(),
+  items: z.object({ type: z.enum(['string', 'number', 'integer', 'boolean', 'object']).optional() }).passthrough().optional(),
+  'x-webhound-primary': z.boolean().optional(),
+  'x-primary-key': z.boolean().optional(),
+}).passthrough();
+const JSON_DATASET_SCHEMA = z.object({
+  type: z.literal('object'),
+  title: z.string().min(1).max(200).optional(),
+  description: z.string().max(2000).optional(),
+  properties: z.record(JSON_SCHEMA_PROPERTY)
+    .refine(value => Object.keys(value).length > 0, 'JSON Schema properties cannot be empty.')
+    .refine(value => Object.keys(value).length <= 200, 'JSON Schema properties support at most 200 fields.'),
+  required: z.array(z.string()).optional(),
+}).passthrough();
+const DATASET_SCHEMA_INPUT = z.union([NATIVE_DATASET_SCHEMA, JSON_DATASET_SCHEMA]);
+const ONBOARDING_CLIENTS = ['hosted', 'manus', 'codex', 'claude_code', 'cursor', 'claude_desktop', 'generic'];
+const DATASET_SCHEMA_EXAMPLES = Object.freeze({
+  webhound_native: {
+    entity_name: 'Company',
+    attributes: [
+      { name: 'company_name', type: 'string', is_primary: true, description: 'Official company name' },
+      { name: 'website', type: 'string', standard_format: 'url' },
+      { name: 'employee_count', type: 'number' },
+    ],
+  },
+  json_schema: {
+    type: 'object',
+    title: 'Company',
+    required: ['company_name'],
+    properties: {
+      company_name: { type: 'string', description: 'Official company name', 'x-webhound-primary': true },
+      website: { type: 'string', format: 'uri' },
+      employee_count: { type: 'integer' },
+    },
+  },
+});
+
+function configuredAttachmentHosts() {
+  const configured = String(process.env.WEBHOUND_ATTACHMENT_HOSTS || '')
+    .split(',')
+    .map(value => value.trim().toLowerCase())
+    .filter(Boolean);
+  return configured.length > 0
+    ? configured
+    : ['files.openai.com', 'files.oaiusercontent.com', 'oaiusercontent.com'];
+}
+
+function isTrustedAttachmentHost(hostname) {
+  const host = String(hostname || '').toLowerCase().replace(/\.$/, '');
+  return configuredAttachmentHosts().some(allowed => host === allowed || host.endsWith(`.${allowed}`));
+}
+
+export function isBlockedAddress(address) {
+  if (!address) return true;
+  if (address.startsWith('::ffff:')) return isBlockedAddress(address.slice(7));
+  if (isIP(address) === 4) {
+    const parts = address.split('.').map(Number);
+    const [a, b] = parts;
+    return a === 0
+      || a === 10
+      || a === 127
+      || (a === 100 && b >= 64 && b <= 127)
+      || (a === 169 && b === 254)
+      || (a === 172 && b >= 16 && b <= 31)
+      || (a === 192 && (b === 0 || b === 168))
+      || (a === 198 && (b === 18 || b === 19 || b === 51))
+      || (a === 203 && b === 0)
+      || a >= 224;
+  }
+  if (isIP(address) === 6) {
+    const normalized = address.toLowerCase();
+    return normalized === '::' || normalized === '::1'
+      || normalized.startsWith('fc') || normalized.startsWith('fd')
+      || /^fe[89ab]/.test(normalized)
+      || normalized.startsWith('ff')
+      || normalized.startsWith('2001:db8:');
+  }
+  return true;
+}
+
+export async function validateRemoteAttachmentUrl(value) {
+  let url;
+  try {
+    url = new URL(value);
+  } catch {
+    throw webhoundError('Attachment download URL is invalid.', { code: 'INVALID_ATTACHMENT_URL', status: 400 });
+  }
+  if (url.protocol !== 'https:' || url.username || url.password || url.port) {
+    throw webhoundError('Attachment URLs must be HTTPS without credentials or a custom port.', {
+      code: 'UNTRUSTED_ATTACHMENT_URL',
+      status: 400,
+      retryable: false,
+    });
+  }
+  if (!isTrustedAttachmentHost(url.hostname)) {
+    throw webhoundError(`Attachment host "${url.hostname}" is not trusted.`, {
+      code: 'UNTRUSTED_ATTACHMENT_HOST',
+      status: 400,
+      retryable: false,
+      nextAction: 'Use an attachment URL supplied by the current MCP client, or upload local/text/base64 content through stdio.',
+    });
+  }
+  const addresses = await lookup(url.hostname, { all: true, verbatim: true }).catch((error) => {
+    throw webhoundError(`Could not resolve attachment host "${url.hostname}": ${error.message}`, {
+      code: 'ATTACHMENT_DNS_ERROR',
+      status: 400,
+      retryable: true,
+    });
+  });
+  if (addresses.length === 0 || addresses.some(item => isBlockedAddress(item.address))) {
+    throw webhoundError('Attachment URL resolved to a private, reserved, or otherwise blocked network address.', {
+      code: 'BLOCKED_ATTACHMENT_ADDRESS',
+      status: 400,
+      retryable: false,
+    });
+  }
+  return url;
+}
+
+async function downloadRemoteAttachment(value, fileId) {
+  let current = await validateRemoteAttachmentUrl(value);
+  for (let redirects = 0; redirects <= 3; redirects += 1) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 20_000);
+    let response;
+    try {
+      response = await fetch(current, { redirect: 'manual', signal: controller.signal });
+    } catch (error) {
+      throw webhoundError(`Could not download attachment ${fileId}: ${error.message}`, {
+        code: error?.name === 'AbortError' ? 'ATTACHMENT_TIMEOUT' : 'ATTACHMENT_DOWNLOAD_FAILED',
+        status: error?.name === 'AbortError' ? 408 : 502,
+        retryable: true,
+      });
+    } finally {
+      clearTimeout(timeout);
+    }
+    if ([301, 302, 303, 307, 308].includes(response.status)) {
+      const location = response.headers.get('location');
+      if (!location || redirects === 3) {
+        throw webhoundError(`Attachment ${fileId} exceeded the redirect limit.`, {
+          code: 'ATTACHMENT_REDIRECT_REJECTED',
+          status: 400,
+          retryable: false,
+        });
+      }
+      current = await validateRemoteAttachmentUrl(new URL(location, current).href);
+      continue;
+    }
+    if (!response.ok) {
+      throw webhoundError(`Could not download attachment ${fileId}: HTTP ${response.status}.`, {
+        code: 'ATTACHMENT_DOWNLOAD_FAILED',
+        status: response.status,
+        retryable: response.status === 429 || response.status >= 500,
+      });
+    }
+    const advertisedLength = Number(response.headers.get('content-length') || 0);
+    if (advertisedLength > MAX_UPLOAD_BYTES) {
+      throw webhoundError(`Attachment ${fileId} exceeds Webhound's 50 MB upload limit.`, {
+        code: 'FILE_TOO_LARGE',
+        status: 413,
+        retryable: false,
+      });
+    }
+    const reader = response.body?.getReader();
+    if (!reader) {
+      throw webhoundError(`Attachment ${fileId} returned no readable body.`, {
+        code: 'ATTACHMENT_DOWNLOAD_FAILED',
+        status: 502,
+        retryable: true,
+      });
+    }
+    const chunks = [];
+    let total = 0;
+    while (true) {
+      const { done, value: chunk } = await reader.read();
+      if (done) break;
+      total += chunk.byteLength;
+      if (total > MAX_UPLOAD_BYTES) {
+        await reader.cancel().catch(() => {});
+        throw webhoundError(`Attachment ${fileId} exceeds Webhound's 50 MB upload limit.`, {
+          code: 'FILE_TOO_LARGE',
+          status: 413,
+          retryable: false,
+        });
+      }
+      chunks.push(Buffer.from(chunk));
+    }
+    if (total === 0) {
+      throw webhoundError(`Attachment ${fileId} is empty.`, { code: 'EMPTY_FILE', status: 400, retryable: false });
+    }
+    return {
+      bytes: Buffer.concat(chunks, total),
+      mimeType: response.headers.get('content-type') || undefined,
+      finalUrl: current.href,
+    };
+  }
+  throw webhoundError(`Attachment ${fileId} could not be downloaded safely.`, {
+    code: 'ATTACHMENT_DOWNLOAD_FAILED',
+    status: 502,
+    retryable: true,
+  });
+}
 const SIDECAR_NOTE_SCHEMA = z.object({
   summary: z.string().min(1).max(500).describe('Concise sourced note or hypothesis for Webhound to consider later.'),
   source_urls: z.array(z.string().url()).max(8).default([]).describe('Source URLs backing the note. Required unless hypothesis=true.'),
@@ -423,10 +1067,12 @@ const HELP_GUIDANCE = Object.freeze({
     suggested_user_facing_wording: 'I will run this as a report because you need a sourced synthesis rather than rows.',
   },
   datasets: {
-    answer: 'Datasets are for extracting sourced rows into a schema: companies, people, products, roles, leads, directories, job targets, or comparable entities.',
+    answer: `Datasets extract sourced rows for companies, people, products, roles, leads, directories, job targets, or comparable entities. The optional schema accepts exactly two forms: Webhound native { entity_name, attributes: [{ name, type, is_primary }] } or object JSON Schema { type: "object", properties }. Native schemas require at least one is_primary field. JSON Schema uses x-webhound-primary=true when supplied; otherwise the first required property, then the first property, becomes the deterministic primary field.`,
     agent_behavior_rules: [
       'Use dataset when the user wants rows, fields, CSV, or a structured list.',
-      'Provide a schema when known; otherwise infer a concise schema.',
+      'Provide one of the documented schema forms when fields matter; omit schema entirely to let Webhound infer it.',
+      `Native example: ${JSON.stringify(DATASET_SCHEMA_EXAMPLES.webhound_native)}`,
+      `JSON Schema example: ${JSON.stringify(DATASET_SCHEMA_EXAMPLES.json_schema)}`,
       'Check rows, fill rate, duplicates, and source coverage after done=true.',
     ],
     related_tools: ['webhound_start_dataset', 'webhound_export_session', 'webhound_get_shareable_link', 'webhound_get_sources'],
@@ -446,7 +1092,7 @@ const HELP_GUIDANCE = Object.freeze({
     suggested_user_facing_wording: 'I can check the sources and claim traces to see whether the output is well-supported.',
   },
   files: {
-    answer: 'Agents can upload local file content for Webhound to use in a report or dataset. Files are useful for grounding research in a brief, CSV, PDF text, notes, or provided source material.',
+    answer: 'Agents can upload CSV, XLSX, XLS, PDF, DOCX, DOC, TXT, Markdown, or VTT files for Webhound to use in a report or dataset. Other formats are rejected before upload.',
     agent_behavior_rules: [
       'Upload files before starting when the file should shape the run.',
       'Use file_ids when starting or resuming a session.',
@@ -507,11 +1153,12 @@ const HELP_GUIDANCE = Object.freeze({
     suggested_user_facing_wording: 'I will diagnose the session and tell you whether it is actually blocked or just still doing budgeted research.',
   },
   onboarding: {
-    answer: 'Onboarding helps the agent connect Webhound, start the first report or dataset, then set workspace rules and a budget policy in the project or global agent rules target the user chooses while the first run works.',
+    answer: 'Onboarding is a compact, client-aware first-run flow. It asks one question at a time and moves directly to a report or dataset. Hosted clients never create or edit workspace rules unless the user explicitly requests that separate action.',
     agent_behavior_rules: [
       'Call webhound_onboarding first and send immediate_next_message rather than summarizing account state.',
       'Ask one question at a time.',
-      'After the first run starts, offer local workspace setup; ask where rules should apply before inspecting or writing.',
+      'Do not inject workspace-rule setup into start_report or start_dataset responses.',
+      'For hosted clients, do not create or edit workspace rules unless the user explicitly asks.',
       'While the first run works, use the sidecar pattern: do useful local/independent work and save concrete source-backed notes with webhound_add_sidecar_notes.',
       'Prefer project-specific rules. If multiple accessible projects are approved, propose per-project rules. If the target project is not accessible, offer a global/user-level rule file or exact snippet to paste.',
       'Do not send workspace files or memories to Webhound for rules.',
@@ -521,14 +1168,16 @@ const HELP_GUIDANCE = Object.freeze({
     suggested_user_facing_wording: 'I will walk you through the first run, then set up when this agent should use Webhound in the future.',
   },
   mcp_setup: {
-    answer: 'For local agents, add the Webhound MCP server config with the user key, then restart/open a new chat so tools load. For hosted apps, paste the hosted MCP URL and bearer token into the app MCP settings.',
+    answer: 'There are two setup paths. For Codex, Claude Code, Cursor, and agents that can edit MCP config, paste the generated setup prompt; it installs the pinned webhound-mcp@0.5.0 package, configures the user key, verifies webhound_health, and explains whether a restart is needed. For Manus and OAuth-capable hosted apps, add https://api.webhound.ai/api/v2/mcp by URL and complete Webhound sign-in; do not add a bearer header in Manus.',
     agent_behavior_rules: [
       'After config changes, remind the user that many clients only load MCP tools at session start.',
       'Use webhound_health after tools appear.',
+      'In Manus use Create -> Add MCP by URL, name it Webhound, paste the hosted URL, leave Advanced empty, save, and complete OAuth.',
+      'Only hosted clients without OAuth support should use a manually generated bearer key under Advanced.',
       'For removal, use webhound_uninstall rather than guessing client-specific cleanup steps.',
     ],
     related_tools: ['webhound_health', 'webhound_onboarding', 'webhound_uninstall'],
-    common_mistakes: ['Trying to use tools before restarting.', 'Putting "Bearer token" as a header name instead of Authorization.', 'Forgetting hosted apps may add the Bearer prefix automatically.'],
+    common_mistakes: ['Trying to use local tools before restarting.', 'Adding bearer headers to Manus even though its connection uses OAuth.', 'Using an unpinned npm package in generated local setup.'],
     suggested_user_facing_wording: 'After you save the MCP config, restart the agent or open a new chat, then I will run webhound_health.',
   },
 });
@@ -563,6 +1212,66 @@ function buildHelp(topic, question = '') {
     no_spend: true,
     ...guidance,
     related_topics: HELP_TOPICS.filter(item => item !== resolvedTopic).slice(0, 6),
+  };
+}
+
+function compactOnboarding(data = {}, { client = 'generic', capabilities = {} } = {}) {
+  const resolvedClient = ONBOARDING_CLIENTS.includes(client) ? client : 'generic';
+  const hosted = resolvedClient === 'hosted' || resolvedClient === 'manus';
+  const account = data.account_state || {};
+  const billing = data.billing || account.billing || {};
+  const freeRun = data.free_run || account.free_run || {};
+  const credits = Number(
+    billing.credits
+    ?? billing.credit_balance_usd
+    ?? account.credits
+    ?? account.credit_balance_usd
+    ?? 0
+  );
+  const canStart = account.can_start_default_paid_run === true
+    || account.ready_for_included_run === true
+    || freeRun.available === true
+    || credits >= 5;
+  const uninterrupted = account.billing_configured_for_uninterrupted_runs === true;
+  const message = canStart
+    ? 'What should your first Webhound run produce: a cited report or a sourced dataset?'
+    : `This account has $${credits.toFixed(2)} in credits and no available included run. Add credits or connect billing, then tell me when it is ready.`;
+  const choices = canStart
+    ? [
+        { id: 'report', label: 'Cited report', next_tool: 'webhound_start_report' },
+        { id: 'dataset', label: 'Sourced dataset', next_tool: 'webhound_start_dataset' },
+      ]
+    : [{ id: 'billing_ready', label: 'Billing is ready', next_tool: 'webhound_account' }];
+  return {
+    flow_id: 'webhound-first-run',
+    flow_version: 1,
+    client: resolvedClient,
+    client_mode: hosted ? 'hosted_oauth' : 'local_or_generic',
+    step: canStart ? 'choose_first_artifact' : 'unblock_billing',
+    message,
+    choices,
+    next_action: canStart ? 'Ask the message exactly once and wait for the user answer.' : 'Send the billing link, wait for confirmation, then call webhound_account before starting.',
+    account_state: {
+      authenticated: account.authenticated !== false,
+      credit_balance_usd: credits,
+      included_run_available: freeRun.available === true,
+      can_start_default_paid_run: canStart,
+      billing_configured_for_uninterrupted_runs: uninterrupted,
+    },
+    recommended_defaults: {
+      default_budget_usd: Number(data.recommended_defaults?.default_budget_usd || 5),
+      default_product: data.recommended_defaults?.default_product || 'report',
+      use_free_run_when_available: data.recommended_defaults?.use_free_run_when_available !== false,
+    },
+    billing_url: canStart ? null : BILLING_URL,
+    workspace_rules: {
+      supported: capabilities.workspace_rules_supported === true,
+      requested: false,
+      instruction: hosted
+        ? 'Do not create or edit workspace rules unless the user explicitly requests that separate action.'
+        : 'Do not create or edit workspace rules during onboarding unless the user explicitly requests that separate action.',
+      validation_if_explicitly_requested: 'Show the complete proposed content and exact destination before writing; after approval, read it back and reject an empty or frontmatter-only file.',
+    },
   };
 }
 
@@ -608,7 +1317,8 @@ const UNINSTALL_GUIDANCE_BY_CLIENT = Object.freeze({
     config_steps: [
       'Open Manus custom MCP integrations.',
       'Remove the Webhound custom MCP server that points at https://api.webhound.ai/api/v2/mcp.',
-      'Remove the associated bearer token from that integration.',
+      'Remove or disconnect the Webhound connector. Manus uses Webhound OAuth, so there is no bearer header to clean up.',
+      'Optionally revoke the connected Manus client from authenticated Webhound MCP settings if the user also wants its token invalidated.',
     ],
     likely_rule_locations: ['Manus workspace instructions or saved preferences that mention Webhound'],
   },
@@ -663,13 +1373,21 @@ function jsonResult(summary, data, isError = false) {
 }
 
 function jsonResultWithOptions(summary, data, options = {}) {
+  const source = data && typeof data === 'object' && !Array.isArray(data) ? data : { data };
+  const semanticError = options.isError === true || source.blocked === true || !!source.error_details;
+  const structured = {
+    ...source,
+    ok: !semanticError,
+    schema_version: STRUCTURED_CONTENT_VERSION,
+    summary: String(summary || ''),
+  };
   const content = [{ type: 'text', text: summary }];
   if (options.includeJsonText === true) {
-    content.push({ type: 'text', text: JSON.stringify(data, null, 2) });
+    content.push({ type: 'text', text: JSON.stringify(structured, null, 2) });
   }
   return {
     content,
-    structuredContent: data,
+    structuredContent: structured,
     isError: !!options.isError,
     ...(options._meta ? { _meta: options._meta } : {}),
   };
@@ -777,9 +1495,15 @@ function sidecarGuidance(data = {}, estimate = runtimeEstimate(data)) {
   if (status === 'awaiting_input') {
     guidance.priority = 'answer_awaiting_input_first';
     guidance.parallel_work_instruction = 'This session is awaiting input. Ask the user for the requested guidance or pass along guidance they already gave with webhound_send_message(reason="awaiting_input"). You may still save sidecar notes, but they will not unblock the run.';
-  } else if (data?.done) {
+  } else if (['paused', 'stopped', 'cancelled', 'canceled'].includes(status)) {
+    guidance.priority = 'await_user_resume_decision';
+    guidance.parallel_work_instruction = 'This session is paused or stopped and is not a successful completion. Do not present an existing artifact as final. Resume only if the user explicitly asks to continue.';
+  } else if (['failed', 'error'].includes(status)) {
+    guidance.priority = 'diagnose_failure';
+    guidance.parallel_work_instruction = 'This session failed and is not a successful completion. Diagnose the failure before resuming or rerunning; do not present an existing artifact as final.';
+  } else if (completionContract(data).successful) {
     guidance.priority = 'read_final_output';
-    guidance.parallel_work_instruction = `The session is terminal. Read or export the final output if done=true. ${evidencePackInstruction()} ${nextResearchInstruction()} New sidecar notes will only matter if the user resumes or adds budget.`;
+    guidance.parallel_work_instruction = `The session completed successfully. Read or export the final output. ${evidencePackInstruction()} ${nextResearchInstruction()} New sidecar notes will only matter if the user resumes or adds budget.`;
   } else {
     guidance.priority = 'sidecar_parallel_work';
   }
@@ -791,6 +1515,205 @@ function blockingAlerts(data) {
   return (data?.alerts || []).filter(alert => alert?.severity === 'error');
 }
 
+function kindFromSession(value = {}) {
+  const raw = String(
+    value.product
+    || value.session_type
+    || value.metadata?.session_type
+    || value.session?.session_type
+    || ''
+  ).toLowerCase();
+  if (raw === 'dataset' || raw === 'extraction') return 'dataset';
+  if (raw === 'report' || raw === 'research') return 'report';
+  return null;
+}
+
+function artifactState(data = {}, kind = null) {
+  const resolvedKind = kind || kindFromSession(data);
+  if (resolvedKind === 'dataset' || Array.isArray(data.rows)) {
+    const rowCount = Number(data.total_rows ?? data.row_count ?? data.rows?.length ?? data.dataset?.row_count ?? data.dataset?.rows?.length ?? 0);
+    return { kind: 'dataset', present: rowCount > 0, row_count: rowCount };
+  }
+  const content = data.content_markdown ?? data.content ?? data.output?.content_markdown ?? data.output?.content;
+  if (typeof content === 'string') {
+    return { kind: 'report', present: content.trim().length > 0, character_count: content.length };
+  }
+  const documents = Array.isArray(data.documents) ? data.documents : [];
+  const outputDocument = documents.find(document => (
+    document.document_role === 'current_output'
+    || (document.is_output === true && document.doc_type !== 'output_archived')
+  ));
+  const documentContent = outputDocument?.content_markdown ?? outputDocument?.content ?? '';
+  return { kind: resolvedKind || 'report', present: String(documentContent).trim().length > 0, character_count: String(documentContent).length };
+}
+
+const SUCCESSFUL_COMPLETION_STATUSES = new Set(['completed', 'complete', 'succeeded', 'success', 'finished']);
+const SUCCESSFUL_COMPLETION_REASONS = new Set(['budget_complete', 'natural_complete', 'completed', 'complete', 'succeeded', 'success', 'finished']);
+const NON_SUCCESS_COMPLETION = Object.freeze({
+  awaiting_input: Object.freeze({
+    code: 'AWAITING_INPUT',
+    status: 409,
+    retryable: true,
+    state: 'awaiting_input',
+    nextAction: 'Answer the checkpoint with webhound_send_message(reason="awaiting_input"); do not treat existing artifacts as final.',
+  }),
+  paused: Object.freeze({
+    code: 'SESSION_PAUSED',
+    status: 409,
+    retryable: true,
+    state: 'paused',
+    nextAction: 'Explain that the session is paused and resume only if the user asks to continue.',
+  }),
+  stopped: Object.freeze({
+    code: 'SESSION_STOPPED',
+    status: 409,
+    retryable: false,
+    state: 'stopped',
+    nextAction: 'Do not present existing artifacts as complete. Resume only if the user explicitly asks to continue, otherwise rerun.',
+  }),
+  cancelled: Object.freeze({
+    code: 'SESSION_STOPPED',
+    status: 409,
+    retryable: false,
+    state: 'cancelled',
+    nextAction: 'Do not present existing artifacts as complete. Start a new run only if the user asks.',
+  }),
+  canceled: Object.freeze({
+    code: 'SESSION_STOPPED',
+    status: 409,
+    retryable: false,
+    state: 'cancelled',
+    nextAction: 'Do not present existing artifacts as complete. Start a new run only if the user asks.',
+  }),
+  failed: Object.freeze({
+    code: 'SESSION_FAILED',
+    status: 422,
+    retryable: false,
+    state: 'failed',
+    nextAction: 'Call webhound_diagnose, fix the reported cause, then resume or rerun; do not present existing artifacts as complete.',
+  }),
+  error: Object.freeze({
+    code: 'SESSION_FAILED',
+    status: 422,
+    retryable: false,
+    state: 'failed',
+    nextAction: 'Call webhound_diagnose, fix the reported cause, then resume or rerun; do not present existing artifacts as complete.',
+  }),
+});
+
+function completionContract(value = {}) {
+  const status = String(value.status || '').trim().toLowerCase();
+  const reason = String(value.completion_reason || '').trim().toLowerCase();
+  const blocked = NON_SUCCESS_COMPLETION[status]
+    || (reason === 'awaiting_input' ? NON_SUCCESS_COMPLETION.awaiting_input : null)
+    || (reason === 'user_stopped' ? NON_SUCCESS_COMPLETION.stopped : null)
+    || (reason === 'failed' || reason === 'stuck_or_empty' ? NON_SUCCESS_COMPLETION.failed : null);
+  if (blocked) return { successful: false, terminal: value.done === true, ...blocked };
+  if (reason === 'credit_exhausted') {
+    return {
+      successful: false,
+      terminal: value.done === true,
+      code: 'CREDIT_EXHAUSTED',
+      status: 402,
+      retryable: true,
+      state: 'credit_exhausted',
+      nextAction: `Send the user to ${BILLING_URL}; after they fix billing, call webhound_account and resume.`,
+    };
+  }
+  const successfulStatus = SUCCESSFUL_COMPLETION_STATUSES.has(status);
+  const successfulReason = !reason || SUCCESSFUL_COMPLETION_REASONS.has(reason);
+  const successful = value.done === true && successfulStatus && successfulReason;
+  return {
+    successful,
+    terminal: value.done === true,
+    state: successful ? 'completed' : value.done === true ? 'unsuccessful_terminal' : 'running',
+    ...(value.done === true && !successful ? {
+      code: 'UNSUCCESSFUL_COMPLETION',
+      status: 422,
+      retryable: false,
+      nextAction: 'Call webhound_diagnose before resuming or rerunning; do not present existing artifacts as complete.',
+    } : {}),
+  };
+}
+
+function withCompletionContract(value = {}) {
+  const contract = completionContract(value);
+  return {
+    ...value,
+    successful_completion: contract.successful,
+    completion_state: contract.state,
+  };
+}
+
+function assertTerminalOutputReady(status = {}, { allowPartial = false } = {}) {
+  const contract = completionContract(status);
+  if (
+    contract.terminal
+    && !contract.successful
+    && !allowPartial
+    && !['AWAITING_INPUT', 'SESSION_PAUSED'].includes(contract.code)
+  ) {
+    throw webhoundError(`The session ended in a non-success state: ${contract.state}.`, {
+      code: contract.code,
+      status: contract.status,
+      retryable: contract.retryable,
+      body: {
+        session_id: status.session_id,
+        status: status.status,
+        completion_reason: status.completion_reason,
+        done: status.done === true,
+        output_ready: status.output_ready === true,
+      },
+      nextAction: contract.nextAction,
+    });
+  }
+  if (contract.successful && status.output_ready !== true) {
+    throw webhoundError('The session is terminal but no final output is ready.', {
+      code: kindFromSession(status) === 'dataset' ? 'DATASET_ZERO_ROWS' : 'EMPTY_OUTPUT',
+      status: 422,
+      retryable: false,
+      body: { session_id: status.session_id, done: true, output_ready: false },
+      nextAction: 'Inspect diagnostics and resume or rerun only after understanding why assembly produced no usable artifact.',
+    });
+  }
+}
+
+function assertArtifactPresent(state, sessionId) {
+  if (state.present) return;
+  throw webhoundError(
+    state.kind === 'dataset' ? 'The completed dataset contains zero rows.' : 'The completed report contains no output content.',
+    {
+      code: state.kind === 'dataset' ? 'DATASET_ZERO_ROWS' : 'EMPTY_OUTPUT',
+      status: 422,
+      retryable: false,
+      body: { session_id: sessionId, actual_kind: state.kind },
+      nextAction: 'Inspect diagnostics and resume or rerun; do not present this run as successful.',
+    }
+  );
+}
+
+function terminalAlerts(data = {}) {
+  const alerts = userVisibleAlerts(data);
+  const contract = completionContract(data);
+  if (contract.terminal && !contract.successful && !alerts.some(alert => String(alert.code || '').toUpperCase() === contract.code)) {
+    alerts.push({
+      severity: ['SESSION_FAILED', 'CREDIT_EXHAUSTED', 'UNSUCCESSFUL_COMPLETION'].includes(contract.code) ? 'error' : 'warning',
+      code: contract.code,
+      message: `The session is not a successful completion: ${contract.state}.`,
+      next_action: contract.nextAction,
+    });
+  }
+  if (contract.successful && data.output_ready !== true && !alerts.some(alert => ['EMPTY_OUTPUT', 'DATASET_ZERO_ROWS', 'empty_output', 'dataset_zero_rows'].includes(alert.code))) {
+    alerts.push({
+      severity: 'error',
+      code: kindFromSession(data) === 'dataset' ? 'DATASET_ZERO_ROWS' : 'EMPTY_OUTPUT',
+      message: 'The run is terminal but no final artifact is ready.',
+      next_action: 'Inspect diagnostics and resume or rerun; do not present the run as successful.',
+    });
+  }
+  return alerts;
+}
+
 function userVisibleAlerts(data) {
   return (data?.alerts || []).filter(alert => (
     (alert?.severity === 'warning' || alert?.severity === 'error')
@@ -800,27 +1723,51 @@ function userVisibleAlerts(data) {
 
 function runningGuidance(data) {
   const errors = blockingAlerts(data);
-  if (data?.done) {
+  if (errors.length > 0) {
+    const alertAction = errors.find(alert => alert.next_action)?.next_action || 'Inspect diagnostics and fix the blocking issue before retrying.';
     return {
-      mcp_next_action: data.output_ready ? 'read_output' : 'inspect_diagnostics',
-      agent_instruction: data.output_ready
-        ? `The run is terminal. Read or export the final output now. ${evidencePackInstruction()} ${nextResearchInstruction()}`
-        : 'The run is terminal but output is not ready. Diagnose before presenting it as successful.',
-      forbidden_next_tools: [],
+      mcp_next_action: 'follow_blocking_alert',
+      agent_instruction: alertAction,
+      forbidden_next_tools: ['webhound_stop unless explicitly requested'],
     };
   }
-  if ((data?.status || '').toLowerCase() === 'awaiting_input') {
+  const status = String(data?.status || '').toLowerCase();
+  if (status === 'awaiting_input') {
     return {
       mcp_next_action: 'ask_user_or_send_guidance',
       agent_instruction: 'The run is awaiting input. Ask the user for the requested guidance or pass along guidance the user already gave with webhound_send_message(reason="awaiting_input"); that resumes the session.',
       forbidden_next_tools: ['webhound_stop unless the user explicitly asks to stop'],
     };
   }
-  if (errors.length > 0) {
+  if (['paused', 'stopped', 'cancelled', 'canceled'].includes(status)) {
     return {
-      mcp_next_action: 'diagnose_or_follow_alert_next_action',
-      agent_instruction: 'A blocking alert is present. Diagnose and follow the alert next_action; do not improvise a stop unless the alert or user explicitly calls for it.',
-      forbidden_next_tools: ['webhound_stop unless explicitly requested'],
+      mcp_next_action: 'ask_before_resume',
+      agent_instruction: 'The session is paused or stopped. Explain that state and resume only if the user asks to continue.',
+      forbidden_next_tools: ['webhound_wait', 'webhound_resume without user intent'],
+    };
+  }
+  if (['failed', 'error'].includes(status)) {
+    return {
+      mcp_next_action: 'inspect_diagnostics',
+      agent_instruction: 'The session failed. Call webhound_diagnose, fix the reported cause, then resume or rerun; do not present any existing artifact as complete.',
+      forbidden_next_tools: ['webhound_get_output as a final result', 'webhound_export_session as a complete export'],
+    };
+  }
+  const completion = completionContract(data);
+  if (completion.successful) {
+    return {
+      mcp_next_action: data.output_ready ? 'read_output' : 'inspect_diagnostics',
+      agent_instruction: data.output_ready
+        ? `The run completed successfully. Read or export the final output now. ${evidencePackInstruction()} ${nextResearchInstruction()}`
+        : 'The run completed but output is not ready. Diagnose before presenting it as successful.',
+      forbidden_next_tools: [],
+    };
+  }
+  if (completion.terminal) {
+    return {
+      mcp_next_action: 'inspect_diagnostics',
+      agent_instruction: completion.nextAction,
+      forbidden_next_tools: ['webhound_get_output as a final result', 'webhound_export_session as a complete export'],
     };
   }
   return {
@@ -835,11 +1782,22 @@ function evidencePackSummary(pack = {}) {
   const sourceCount = Number(pack.evidence?.source_count || 0);
   const claimCount = Number(pack.evidence?.claim_count || 0);
   const rowCount = Number(pack.dataset?.row_count || 0);
-  return `Complete evidence pack for ${pack.session_id}: ${documents.length} documents, ${rowCount} rows, ${claimCount} claims, ${sourceCount} sources. Nothing was truncated or omitted.`;
+  const label = pack.complete_evidence_pack ? 'Complete evidence pack' : 'Partial evidence snapshot';
+  return `${label} for ${pack.session_id}: ${documents.length} documents, ${rowCount} rows, ${claimCount} claims, ${sourceCount} sources.`;
 }
 
 async function buildEvidencePack(client, sessionId, options = {}, status = null) {
   const session = await client.getSession(sessionId);
+  const actualKind = kindFromSession(session) || kindFromSession(status);
+  if (options.kind && options.kind !== 'auto' && actualKind && options.kind !== actualKind) {
+    throw webhoundError(`Requested a ${options.kind} evidence pack from a ${actualKind} session.`, {
+      code: 'KIND_MISMATCH',
+      status: 409,
+      retryable: false,
+      body: { session_id: sessionId, requested_kind: options.kind, actual_kind: actualKind },
+      nextAction: `Retry with kind: "${actualKind}" or kind: "auto".`,
+    });
+  }
   const excludedByRequest = [];
   const documents = options.include_working_docs === false
     ? (session.documents || []).filter(document => document.document_role === 'current_output' || (document.is_output && document.doc_type !== 'output_archived'))
@@ -854,7 +1812,13 @@ async function buildEvidencePack(client, sessionId, options = {}, status = null)
     delete evidence.sources;
     excludedByRequest.push('sources');
   }
-  const complete = excludedByRequest.length === 0;
+  const artifact = artifactState(session, actualKind);
+  const completion = completionContract(status || {});
+  if (completion.successful) assertArtifactPresent(artifact, sessionId);
+  const complete = completion.successful
+    && status?.output_ready === true
+    && artifact.present
+    && excludedByRequest.length === 0;
   return {
     ...session,
     documents,
@@ -864,6 +1828,8 @@ async function buildEvidencePack(client, sessionId, options = {}, status = null)
     omitted: excludedByRequest,
     excluded_by_request: excludedByRequest,
     requested_kind: options.kind || 'auto',
+    actual_kind: actualKind,
+    artifact,
     evidence_pack_instruction: evidencePackInstruction(),
     next_research_instruction: nextResearchInstruction(),
   };
@@ -889,6 +1855,16 @@ function errorResult(error, fallback = 'Webhound MCP tool failed') {
       error: body.error || 'Insufficient credits',
       code: 'billing_required',
       status: 402,
+      message: body.message || error?.message || fallback,
+      retryable: false,
+      next_action: 'Open billing, add credits or configure payment, then call webhound_account after the user confirms.',
+      error_details: {
+        code: 'billing_required',
+        message: body.message || error?.message || fallback,
+        status: 402,
+        retryable: false,
+        next_action: 'Open billing, add credits or configure payment, then call webhound_account after the user confirms.',
+      },
       blocked: true,
       no_spend: true,
       action_started: false,
@@ -921,14 +1897,40 @@ function errorResult(error, fallback = 'Webhound MCP tool failed') {
     };
     return jsonResult(`Billing setup needed before Webhound can continue.\n\n${userMessage}`, data, false);
   }
+  const code = error?.code || (Number(status) === 404
+    ? 'SESSION_NOT_FOUND'
+    : Number(status) === 401
+      ? 'AUTH_REQUIRED'
+      : Number(status) === 403
+        ? 'FORBIDDEN'
+        : Number(status) >= 500
+          ? 'API_UNAVAILABLE'
+          : 'WEBHOUND_ERROR');
+  const retryable = error?.retryable === true || Number(status) === 429 || Number(status) >= 500;
+  const nextAction = error?.nextAction || (code === 'SESSION_NOT_FOUND'
+    ? 'Verify the session ID and authenticated account. Do not call webhound_wait again for this ID.'
+    : code === 'AUTH_REQUIRED'
+      ? 'Authenticate Webhound, then call webhound_health before retrying.'
+      : retryable
+        ? 'Retry only after confirming API reachability or waiting for the transient failure to clear.'
+        : 'Correct the request before retrying.');
+  const message = error?.message || fallback;
   const data = {
-    error: error?.body?.error || error?.code || 'webhound_error',
-    message: error?.message || fallback,
+    error: error?.body?.error || code,
+    code,
+    message,
     status,
+    retryable,
+    next_action: nextAction,
     body: error?.body || null,
-    next_actions: status === 402
-      ? ['Tell the user to add credits or use an available free-run pass before retrying.']
-      : ['Inspect the error and retry only after the cause is fixed.'],
+    error_details: {
+      code,
+      message,
+      status: Number.isFinite(Number(status)) ? Number(status) : null,
+      retryable,
+      next_action: nextAction,
+    },
+    next_actions: [nextAction],
   };
   const isAuthError = Number(status) === 401;
   return jsonResultWithOptions(`${fallback}: ${data.message}`, data, {
@@ -980,18 +1982,25 @@ function workspaceRuleFollowup(kind, result, options = {}) {
 function describeStarted(kind, client, result, options = {}) {
   const sessionId = result.session_id;
   const freeRun = result.free_run?.reserved ? ' Free-run pass reserved.' : '';
-  const followup = workspaceRuleFollowup(kind, result, options);
   const checkIn = scheduledCheckInGuidance(runtimeEstimate(result), { initial: true });
-  return `${kind} started: ${sessionId}\nOpen: ${client.webUrl(sessionId)}\n\nSidecar guidance: keep doing useful independent work while Webhound runs. If you find a concrete source-backed note, use webhound_add_sidecar_notes instead of steering. Use webhound_list_sidecar_notes or webhound_update_sidecar_note if you need to inspect, correct, or dismiss shared notes later.\n\nCheck-in guidance: ${checkIn.instruction}\n\nIf this is onboarding or the user's first Webhound run, send this follow-up next. Do not compress it into one yes/no question:\n\n${followup}\n\nAfter the user answers, ask for the rule target before writing anything, save/edit rules only in the chosen project/global target if possible, then watch until done=true. If the environment supports scheduled check-ins, use them between watches.${freeRun}`;
+  return `${kind} started: ${sessionId}\nOpen: ${client.webUrl(sessionId)}\n\nKeep doing useful independent work while Webhound runs. Save concrete source-backed notes with webhound_add_sidecar_notes instead of steering. ${checkIn.instruction} Watch until done=true; output_ready by itself is not terminal.${freeRun}`;
 }
 
 function registerTool(server, client, name, config, handler) {
   server.registerTool(name, completeToolConfig(name, config), async (args) => {
     const previousToolContext = client?.setToolContext ? client.setToolContext(name, VERSION) : null;
     try {
-      return await handler(args || {});
+      const result = await handler(args || {});
+      if (result?.structuredContent && typeof result.structuredContent === 'object') {
+        result.structuredContent.tool = name;
+      }
+      return result;
     } catch (error) {
-      return errorResult(error, `${name} failed`);
+      const result = errorResult(error, `${name} failed`);
+      if (result?.structuredContent && typeof result.structuredContent === 'object') {
+        result.structuredContent.tool = name;
+      }
+      return result;
     } finally {
       if (client?.restoreToolContext) client.restoreToolContext(previousToolContext);
     }
@@ -1089,23 +2098,25 @@ export function createWebhoundMcpServer(options = {}) {
   }, async () => {
     const data = await client.health();
     data.mcp = { version: VERSION, tools: TOOL_NAMES };
-    return jsonResult(data.authenticated ? 'Webhound MCP is connected.' : 'Webhound MCP is not authenticated.', data, !data.authenticated);
+    const summary = data.mcp_ready
+      ? 'Webhound MCP is ready, the API is reachable, and authentication succeeded.'
+      : `Webhound MCP is not ready: api_reachable=${data.api_reachable}; authenticated=${data.authenticated}.`;
+    return jsonResult(summary, data, !data.mcp_ready);
   });
 
   registerTool(server, client, 'webhound_onboarding', {
     title: 'Webhound Onboarding',
-    description: 'No-spend agent-led onboarding guide. Call this first for setup. Then guide the user step by step using immediate_next_message; do not just summarize account state.',
-    inputSchema: {},
+    description: 'No-spend compact, client-aware first-run guide. It returns one message, choices, and one next action. Hosted clients never write workspace rules unless the user explicitly requests that separate action.',
+    inputSchema: {
+      client: z.enum(ONBOARDING_CLIENTS).default('generic'),
+      capabilities: z.object({
+        workspace_rules_supported: z.boolean().optional(),
+      }).strict().optional(),
+    },
     annotations: { readOnlyHint: true, openWorldHint: false },
-  }, async () => {
-    const data = await client.onboarding();
-    const next = data?.immediate_next_message || data?.user_facing_guidance?.immediate_next_message || 'Guide the user through Webhound onboarding one step at a time.';
-    return jsonResult([
-      'Webhound onboarding instructions for the calling agent:',
-      'Do not summarize this as account status. Send the user the first onboarding message now, ask one question, and wait for their answer.',
-      'Start with:',
-      next,
-    ].join('\n\n'), data);
+  }, async (args) => {
+    const data = compactOnboarding(await client.onboarding(), args);
+    return jsonResult(data.message, data);
   });
 
   registerTool(server, client, 'webhound_help', {
@@ -1166,25 +2177,13 @@ export function createWebhoundMcpServer(options = {}) {
     },
   }, async (args) => {
     const data = await client.startReport(args);
-    const followup = workspaceRuleFollowup('Report', data, { prompt: args.prompt });
     const estimate = runtimeEstimate(data);
-    return jsonResult(describeStarted('Report', client, data, { prompt: args.prompt }), {
+    return jsonResult(describeStarted('Report', client, data), {
       ...data,
 	      url: client.webUrl(data.session_id),
 	      runtime_estimate: estimate,
 	      followup_check_in: scheduledCheckInGuidance(estimate, { initial: true }),
 	      sidecar_guidance: sidecarGuidance(data, estimate),
-	      onboarding_next_step: 'handle_setup_choice_before_repeated_waiting',
-      onboarding_workspace_rule_prompt: {
-        instruction: 'If this run was started during onboarding or a first-run flow, do not immediately enter a visible wait loop. Send immediate_next_message or a close copy and handle the local setup choice before repeated watching. Ask permission before inspecting files, memories, or project context. If the user agrees to setup, ask where rules should apply before inspecting anything. Do not ask for approval of one generic combined rule.',
-        immediate_next_message: followup,
-        use_cases: workspaceUseCasesForStartedRun('Report', args.prompt),
-        budget_policy: WORKSPACE_BUDGET_POLICY,
-        rule_targeting: WORKSPACE_RULE_TARGETING,
-        audit_rubric: WORKSPACE_AUDIT_RUBRIC,
-        personalization_instruction: 'If the user agrees, ask where rules should apply: this project, a specific project this agent can access, all accessible relevant projects, or global agent rules. Do not assume the current temporary onboarding directory is the right target. Inspect only the approved target context available to this agent, then present a concise proposal for where Webhound fits. If multiple projects are approved and accessible, propose per-project rules instead of one generic blob. Include any number of genuinely useful rules; do not pad to a fixed count. Include a short budget policy in the same proposal: either one default budget or simple tiers like $2 quick, $5 standard, and $10 deep. Before writing anything, ask whether there are any other situations or budget tiers the user wants to add, then ask the user to confirm or edit. Do not send workspace files, memories, private notes, or workspace-derived rules to Webhound for setup; save approved rules only to the chosen local or global rule target if the client allows it. If this agent cannot access the requested project, offer the global rule file or give the exact snippet to paste. After saving, tell the user the rules apply after restarting/opening a new chat, then return to watching the run and report estimated time remaining from runtime_estimate.',
-      },
-      recommended_next_tool_after_onboarding: 'handle_setup_choice_or_schedule_check_in',
     });
   });
 
@@ -1193,7 +2192,7 @@ export function createWebhoundMcpServer(options = {}) {
     description: 'Start a private long-running dataset with Hound, Webhound\'s DeepSeek V4 Pro + GPT-5.4 research harness. Budget controls extraction depth; watch until done=true. Do not force finalization before done=true.',
     inputSchema: {
       prompt: z.string().min(8).max(12000),
-      schema: z.any().optional(),
+      schema: DATASET_SCHEMA_INPUT.optional().describe(`Optional explicit schema. Native example: ${JSON.stringify(DATASET_SCHEMA_EXAMPLES.webhound_native)} JSON Schema example: ${JSON.stringify(DATASET_SCHEMA_EXAMPLES.json_schema)}`),
       budget: z.number().min(1).max(500).optional(),
       title: z.string().optional(),
       context_session_ids: z.array(z.string()).optional(),
@@ -1203,25 +2202,13 @@ export function createWebhoundMcpServer(options = {}) {
     },
   }, async (args) => {
     const data = await client.startDataset(args);
-    const followup = workspaceRuleFollowup('Dataset', data, { prompt: args.prompt });
     const estimate = runtimeEstimate(data);
-    return jsonResult(describeStarted('Dataset', client, data, { prompt: args.prompt }), {
+    return jsonResult(describeStarted('Dataset', client, data), {
       ...data,
 	      url: client.webUrl(data.session_id),
 	      runtime_estimate: estimate,
 	      followup_check_in: scheduledCheckInGuidance(estimate, { initial: true }),
 	      sidecar_guidance: sidecarGuidance(data, estimate),
-	      onboarding_next_step: 'handle_setup_choice_before_repeated_waiting',
-      onboarding_workspace_rule_prompt: {
-        instruction: 'If this run was started during onboarding or a first-run flow, do not immediately enter a visible wait loop. Send immediate_next_message or a close copy and handle the local setup choice before repeated watching. Ask permission before inspecting files, memories, or project context. If the user agrees to setup, ask where rules should apply before inspecting anything. Do not ask for approval of one generic combined rule.',
-        immediate_next_message: followup,
-        use_cases: workspaceUseCasesForStartedRun('Dataset', args.prompt),
-        budget_policy: WORKSPACE_BUDGET_POLICY,
-        rule_targeting: WORKSPACE_RULE_TARGETING,
-        audit_rubric: WORKSPACE_AUDIT_RUBRIC,
-        personalization_instruction: 'If the user agrees, ask where rules should apply: this project, a specific project this agent can access, all accessible relevant projects, or global agent rules. Do not assume the current temporary onboarding directory is the right target. Inspect only the approved target context available to this agent, then present a concise proposal for where Webhound fits. If multiple projects are approved and accessible, propose per-project rules instead of one generic blob. Include any number of genuinely useful rules; do not pad to a fixed count. Include a short budget policy in the same proposal: either one default budget or simple tiers like $2 quick, $5 standard, and $10 deep. Before writing anything, ask whether there are any other situations or budget tiers the user wants to add, then ask the user to confirm or edit. Do not send workspace files, memories, private notes, or workspace-derived rules to Webhound for setup; save approved rules only to the chosen local or global rule target if the client allows it. If this agent cannot access the requested project, offer the global rule file or give the exact snippet to paste. After saving, tell the user the rules apply after restarting/opening a new chat, then return to watching the run and report estimated time remaining from runtime_estimate.',
-      },
-      recommended_next_tool_after_onboarding: 'handle_setup_choice_or_schedule_check_in',
     });
   });
 
@@ -1231,16 +2218,19 @@ export function createWebhoundMcpServer(options = {}) {
     inputSchema: { session_id: z.string() },
     annotations: { readOnlyHint: true, openWorldHint: false },
   }, async ({ session_id }) => {
-	    const data = await client.watch(session_id);
+	    const data = withCompletionContract(await client.watch(session_id));
 	    const guidance = runningGuidance(data);
 	    const estimate = runtimeEstimate(data);
 	    const checkIn = scheduledCheckInGuidance(estimate);
-	    const structured = { ...data, alerts: userVisibleAlerts(data), runtime_estimate: estimate, followup_check_in: checkIn, sidecar_guidance: sidecarGuidance(data, estimate), ...guidance };
-    const summary = data.done
-      ? `Session ${session_id} is done: ${data.completion_reason || data.status}. output_ready=${!!data.output_ready}.`
-	      : `Session ${session_id} is still running: ${data.status || 'running'}.${budgetProgress(data)} Next check: ${estimate.recommended_next_check_label || 'later'}. Keep useful sidecar work going between check-ins; save source-backed notes with webhound_add_sidecar_notes, not steering.`;
+	    const visibleAlerts = terminalAlerts(data);
+	    const structured = { ...data, alerts: visibleAlerts, runtime_estimate: estimate, followup_check_in: checkIn, sidecar_guidance: sidecarGuidance(data, estimate), ...guidance };
+    const summary = data.successful_completion
+      ? `Session ${session_id} completed successfully: ${data.completion_reason || data.status}. output_ready=${!!data.output_ready}.`
+      : data.done
+        ? `Session ${session_id} ended without successful completion: ${data.completion_reason || data.status}. Do not treat existing artifacts as final.`
+      : `Session ${session_id} is still running: ${data.status || 'running'}.${budgetProgress(data)} Next check: ${estimate.recommended_next_check_label || 'later'}. Keep useful sidecar work going between check-ins; save source-backed notes with webhound_add_sidecar_notes, not steering.`;
     return jsonResultWithOptions(summary, structured, {
-      isError: data.alerts?.some(alert => alert.severity === 'error') && data.done,
+      isError: visibleAlerts.some(alert => alert.severity === 'error') && data.done,
       includeJsonText: false,
     });
   });
@@ -1255,21 +2245,26 @@ export function createWebhoundMcpServer(options = {}) {
     },
     annotations: { readOnlyHint: true, openWorldHint: false },
 	  }, async ({ session_id, max_wait_seconds, poll_interval_seconds }) => {
-	    const data = await client.wait(session_id, { maxWaitSeconds: max_wait_seconds, pollIntervalSeconds: poll_interval_seconds });
+	    const data = withCompletionContract(await client.wait(session_id, { maxWaitSeconds: max_wait_seconds, pollIntervalSeconds: poll_interval_seconds }));
 	    const guidance = runningGuidance(data);
 	    const estimate = runtimeEstimate(data);
 	    const structured = {
 	      ...data,
-	      alerts: userVisibleAlerts(data),
+	      alerts: terminalAlerts(data),
 	      runtime_estimate: estimate,
 	      followup_check_in: scheduledCheckInGuidance(estimate),
 	      sidecar_guidance: sidecarGuidance(data, estimate),
 	      ...guidance,
 	    };
-    const summary = data.done
-      ? `Session ${session_id} is done.`
-	      : `Session ${session_id} is still running: ${data.status || 'running'}.${budgetProgress(data)} Next check: ${estimate.recommended_next_check_label || 'later'}. Keep useful sidecar work going between check-ins; save source-backed notes with webhound_add_sidecar_notes, not steering.`;
-    return jsonResultWithOptions(summary, structured, { includeJsonText: false });
+    const summary = data.successful_completion
+      ? `Session ${session_id} completed successfully.`
+      : data.done
+        ? `Session ${session_id} ended without successful completion. Do not treat existing artifacts as final.`
+      : `Session ${session_id} is still running: ${data.status || 'running'}.${budgetProgress(data)} Next check: ${estimate.recommended_next_check_label || 'later'}. Keep useful sidecar work going between check-ins; save source-backed notes with webhound_add_sidecar_notes, not steering.`;
+    return jsonResultWithOptions(summary, structured, {
+      includeJsonText: false,
+      isError: structured.done && structured.alerts.some(alert => alert.severity === 'error'),
+    });
   });
 
   registerTool(server, client, 'webhound_add_sidecar_notes', {
@@ -1440,8 +2435,9 @@ export function createWebhoundMcpServer(options = {}) {
     },
     annotations: { readOnlyHint: true, openWorldHint: false },
   }, async ({ session_id, allow_partial, ...args }) => {
-    const status = await client.watch(session_id).catch(() => null);
-	    if (status && !status.done && !allow_partial) {
+    const status = withCompletionContract(await client.watch(session_id));
+    assertTerminalOutputReady(status, { allowPartial: allow_partial });
+	    if (!status.successful_completion && !allow_partial) {
 	      const guidance = runningGuidance(status);
 	      const estimate = runtimeEstimate(status);
 	      return jsonResultWithOptions(
@@ -1449,14 +2445,21 @@ export function createWebhoundMcpServer(options = {}) {
 	        { ...status, ...guidance, runtime_estimate: estimate, sidecar_guidance: sidecarGuidance(status, estimate), output_deferred_until_done: true },
 	        { includeJsonText: false }
 	      );
-	    }
+    }
     const data = await client.getOutput(session_id, args);
+    const actualKind = kindFromSession(status) || (Array.isArray(data.rows) ? 'dataset' : 'report');
+    const artifact = artifactState(data, actualKind);
+    if (status.successful_completion) assertArtifactPresent(artifact, session_id);
+    const completeOutput = status.successful_completion === true && status.output_ready === true && artifact.present;
 	    const structured = {
 	      ...data,
-	      complete_output: true,
+	      complete_output: completeOutput,
+        requested_kind: args.kind || 'auto',
+        actual_kind: actualKind,
+        artifact,
 	      truncated: false,
 	      omitted: [],
-	      ...(status?.done ? {
+	      ...(status?.successful_completion ? {
 	        evidence_pack_instruction: evidencePackInstruction(),
 	        next_research_instruction: nextResearchInstruction(),
 	      } : {}),
@@ -1464,7 +2467,7 @@ export function createWebhoundMcpServer(options = {}) {
 	    const size = typeof data.content_markdown === 'string'
 	      ? `${data.content_markdown.length} Markdown characters`
 	      : `${data.total_rows || data.rows?.length || 0} rows`;
-	    const prefix = status && !status.done ? 'Complete partial snapshot' : 'Complete output';
+	    const prefix = completeOutput ? 'Complete output' : 'Partial output snapshot';
 	    return jsonResultWithOptions(`${prefix} for ${session_id}: ${size}; nothing truncated or omitted.`, structured);
 	  });
 
@@ -1482,8 +2485,9 @@ export function createWebhoundMcpServer(options = {}) {
     },
     annotations: { readOnlyHint: true, openWorldHint: false },
   }, async ({ session_id, include_content, include_binary_base64, allow_partial, ...args }) => {
-    const status = await client.watch(session_id).catch(() => null);
-	    if (status && !status.done && !allow_partial) {
+    const status = withCompletionContract(await client.watch(session_id));
+    assertTerminalOutputReady(status, { allowPartial: allow_partial });
+	    if (!status.successful_completion && !allow_partial) {
 	      const guidance = runningGuidance(status);
 	      const estimate = runtimeEstimate(status);
 	      return jsonResultWithOptions(
@@ -1495,21 +2499,32 @@ export function createWebhoundMcpServer(options = {}) {
     const data = await client.exportSession(session_id, args);
     const content = data.content || '';
     const isBase64 = data.encoding === 'base64';
+    const delivery = include_content && !isBase64
+      ? 'inline_text'
+      : include_content && isBase64 && include_binary_base64
+        ? 'inline_base64'
+        : data.download_url
+          ? 'download_url'
+          : 'none';
+    const completeExport = status.successful_completion === true
+      && status.output_ready === true
+      && delivery !== 'none';
 	    const structured = {
 	      ...data,
 	      content: include_content && !isBase64 ? String(content) : undefined,
 	      content_base64: include_content && isBase64 && include_binary_base64 ? content : undefined,
-	      complete_export: !isBase64 || !include_content || include_binary_base64,
+	      complete_export: completeExport,
+        delivery,
 	      content_truncated: false,
 	      omitted: isBase64 && include_content && !include_binary_base64 ? ['binary_base64'] : [],
 	      binary_download_url: isBase64 && !include_binary_base64 ? data.download_url : undefined,
-      ...(status?.done ? {
+      ...(status?.successful_completion ? {
         evidence_pack_instruction: evidencePackInstruction(),
         next_research_instruction: nextResearchInstruction(),
       } : {}),
 	    };
-    const terminalInstruction = status?.done ? ` ${evidencePackInstruction()}` : '';
-    const summary = `${status && !status.done ? 'Partially exported' : 'Exported'} ${session_id} as ${data.filename} (${data.mime_type}, ${data.size_bytes} bytes).${terminalInstruction}`;
+    const terminalInstruction = status.successful_completion ? ` ${evidencePackInstruction()}` : '';
+    const summary = `${completeExport ? 'Exported' : 'Partially exported'} ${session_id} as ${data.filename} (${data.mime_type}, ${data.size_bytes} bytes).${terminalInstruction}`;
     return jsonResultWithOptions(isBase64 && !include_binary_base64 ? `${summary} The complete binary is at download_url; set include_binary_base64=true only if raw bytes are required.` : `${summary} Content is complete and uncapped.`, structured);
   });
 
@@ -1526,8 +2541,9 @@ export function createWebhoundMcpServer(options = {}) {
     },
     annotations: { readOnlyHint: true, openWorldHint: false },
   }, async ({ session_id, allow_partial, ...args }) => {
-    const status = await client.watch(session_id).catch(() => null);
-    if (status && !status.done && !allow_partial) {
+    const status = withCompletionContract(await client.watch(session_id));
+    assertTerminalOutputReady(status, { allowPartial: allow_partial });
+    if (!status.successful_completion && !allow_partial) {
       const guidance = runningGuidance(status);
       const estimate = runtimeEstimate(status);
       return jsonResultWithOptions(
@@ -1591,7 +2607,7 @@ export function createWebhoundMcpServer(options = {}) {
     inputSchema: {
       limit: z.number().int().min(1).max(50).default(15),
       type: z.enum(['research', 'extraction', 'all']).default('all'),
-      status: z.string().optional(),
+      status: z.enum(['all', 'active', 'researching', 'running', 'paused', 'awaiting_input', 'completed', 'failed', 'cancelled', 'stopped']).default('all'),
       page: z.number().int().min(1).default(1),
     },
     annotations: { readOnlyHint: true, openWorldHint: false },
@@ -1611,7 +2627,7 @@ export function createWebhoundMcpServer(options = {}) {
 
   registerTool(server, client, 'webhound_upload_file', {
     title: 'Upload Webhound File',
-    description: 'Upload ChatGPT attachments, a local file, text, or base64 content for use in a report or dataset.',
+    description: 'Upload a CSV, XLSX, XLS, PDF, DOCX, DOC, TXT, Markdown, or VTT ChatGPT attachment, local file, text, or base64 content for use in a report or dataset.',
     inputSchema: {
       files: z.array(CHATGPT_FILE_SCHEMA).max(10).optional(),
       local_path: z.string().optional(),
@@ -1622,21 +2638,39 @@ export function createWebhoundMcpServer(options = {}) {
     },
     _meta: { 'openai/fileParams': ['files'] },
   }, async (args) => {
+    const sourcesProvided = [
+      Array.isArray(args.files) && args.files.length > 0,
+      args.local_path !== undefined,
+      args.text !== undefined,
+      args.content_base64 !== undefined,
+    ].filter(Boolean).length;
+    if (sourcesProvided !== 1) {
+      throw webhoundError('Provide exactly one upload source: files, local_path, text, or content_base64.', {
+        code: 'VALIDATION_ERROR',
+        status: 400,
+        retryable: false,
+      });
+    }
     if (Array.isArray(args.files) && args.files.length > 0) {
       const uploaded = [];
       for (const file of args.files) {
-        const response = await fetch(file.download_url);
-        if (!response.ok) throw new Error(`Could not download ChatGPT file ${file.file_id}: HTTP ${response.status}`);
-        const contentLength = Number(response.headers.get('content-length') || 0);
-        if (contentLength > 50 * 1024 * 1024) throw new Error(`ChatGPT file ${file.file_id} exceeds Webhound's 50 MB upload limit.`);
-        const bytes = Buffer.from(await response.arrayBuffer());
-        if (bytes.length > 50 * 1024 * 1024) throw new Error(`ChatGPT file ${file.file_id} exceeds Webhound's 50 MB upload limit.`);
+        const downloaded = await downloadRemoteAttachment(file.download_url, file.file_id);
+        const remoteUrlName = (() => {
+          try {
+            const segment = new URL(downloaded.finalUrl).pathname.split('/').filter(Boolean).pop() || '';
+            return decodeURIComponent(segment);
+          } catch {
+            return '';
+          }
+        })();
+        const remoteMime = validateUploadMimeType(file.mime_type || downloaded.mimeType, file.file_name || remoteUrlName);
+        const uploadName = file.file_name || safeUploadFilename(`chatgpt-${file.file_id}`, remoteMime);
         const result = await client.uploadFile({
-          file_name: file.file_name || `chatgpt-${file.file_id}`,
-          content_base64: bytes.toString('base64'),
-          mime_type: file.mime_type || response.headers.get('content-type') || undefined,
+          file_name: uploadName,
+          content_base64: downloaded.bytes.toString('base64'),
+          mime_type: remoteMime,
         });
-        uploaded.push({ ...result, chatgpt_file_id: file.file_id });
+        uploaded.push({ ...result, chatgpt_file_id: file.file_id, source_url: downloaded.finalUrl });
       }
       return jsonResult(`${uploaded.length} ChatGPT file${uploaded.length === 1 ? '' : 's'} uploaded to Webhound.`, {
         files: uploaded,
@@ -1659,11 +2693,12 @@ export function createWebhoundMcpServer(options = {}) {
     inputSchema: { session_id: z.string() },
     annotations: { readOnlyHint: true, openWorldHint: false },
   }, async ({ session_id }) => {
-	    const data = await client.watch(session_id);
-	    const errors = blockingAlerts(data);
+	    const data = withCompletionContract(await client.watch(session_id));
+	    const visibleAlerts = terminalAlerts(data);
+	    const errors = visibleAlerts.filter(alert => alert.severity === 'error');
 	    const guidance = runningGuidance(data);
 	    const estimate = runtimeEstimate(data);
-	    const structured = { ...data, runtime_estimate: estimate, sidecar_guidance: sidecarGuidance(data, estimate), ...guidance };
+	    const structured = { ...data, alerts: visibleAlerts, runtime_estimate: estimate, sidecar_guidance: sidecarGuidance(data, estimate), ...guidance };
 	    const summary = errors.length
 	      ? `Session ${session_id} has blocking issue(s): ${errors.map(item => item.code).join(', ')}.`
 	      : data.done

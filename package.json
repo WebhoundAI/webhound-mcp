@@ -1,10 +1,10 @@
 {
   "name": "webhound-mcp",
-  "version": "0.4.3",
+  "version": "0.5.0",
   "mcpName": "ai.webhound/webhound",
   "description": "Run budgeted reports and datasets with Hound, Webhound's DeepSeek V4 Pro + GPT-5.4 research harness, and return inspectable cited evidence.",
   "bin": {
-    "webhound-mcp": "bin/server.mjs"
+    "webhound-mcp": "dist/webhound-mcp.mjs"
   },
   "type": "module",
   "engines": {
@@ -13,15 +13,29 @@
   "files": [
     "bin/",
     "core/",
-    "README.md"
+    "dist/",
+    "README.md",
+    "canonical-runtime.json",
+    "npm-shrinkwrap.json"
   ],
   "scripts": {
-    "self-test": "node bin/server.mjs --self-test",
-    "mcp:self-test": "node bin/server.mjs --self-test"
+    "build": "node scripts/build-package.mjs",
+    "self-test": "npm run build && node dist/webhound-mcp.mjs --self-test",
+    "mcp:self-test": "npm run self-test",
+    "test": "node --test tests/*.test.mjs",
+    "audit:prod": "npm audit --omit=dev --audit-level=moderate",
+    "parity:check": "node scripts/check-runtime-manifest.mjs",
+    "parity:compare": "node scripts/compare-runtime.mjs",
+    "package:check": "node scripts/verify-package.mjs",
+    "consumer:check": "node scripts/verify-consumer.mjs",
+    "release:check": "npm run self-test && npm test && npm run audit:prod && npm run parity:check && npm run package:check && npm run consumer:check",
+    "prepublishOnly": "npm run release:check"
   },
-  "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.29.0",
-    "zod": "^3.23.0"
+  "dependencies": {},
+  "devDependencies": {
+    "@modelcontextprotocol/sdk": "1.29.0",
+    "esbuild": "0.28.1",
+    "zod": "3.25.76"
   },
   "overrides": {
     "@hono/node-server": "2.0.11",

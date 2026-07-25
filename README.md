@@ -63,7 +63,7 @@ ChatGPT developer mode:
 1. Turn on Developer mode under Settings → Security and login.
 2. Open Settings → Plugins, create an app, and use the hosted MCP URL above.
 3. Click Connect. ChatGPT opens Webhound's authorization page.
-4. Paste a Webhound API key once. Webhound exchanges it for a scoped MCP token; ChatGPT stores that token for later calls.
+4. Sign in to Webhound and approve the requested MCP scopes. Do not paste an API key into the OAuth flow.
 
 The ChatGPT app can accept attachments and return normal MCP status, output, working documents, claims, and sources. Webhound deliberately does not attach a custom interactive panel beneath tool calls. Public distribution still requires plugin submission through OpenAI.
 
@@ -94,7 +94,7 @@ Create a Webhound API key, then add the stdio server to your agent:
   "mcpServers": {
     "webhound": {
       "command": "npx",
-      "args": ["-y", "webhound-mcp"],
+      "args": ["-y", "webhound-mcp@0.5.0"],
       "env": {
         "WEBHOUND_KEY": "wh_..."
       }
@@ -120,25 +120,35 @@ Smithery:
 
 Do not distribute one user's private toolbox endpoint as if it were a shared Webhound credential. Other users should add Webhound to their own toolbox or connect to the hosted Webhound MCP URL directly.
 
-Manus or generic hosted MCP:
+Manus:
 
 ```text
+Open: https://manus.im/app/plugins
+Choose: Create → Add MCP by URL
+Server name: Webhound
 Server URL: https://api.webhound.ai/api/v2/mcp
-Auth type: HTTP header
-Header name: Authorization
-Header value: Bearer wh_...
-
-If the MCP app has a dedicated bearer-token field that automatically adds
-`Bearer`, paste only `wh_...` in that token field.
+Advanced settings: leave empty
 ```
+
+Save, sign in to Webhound, approve the connection, then start a new Manus task
+and send:
+
+```text
+Call webhound_onboarding with client set to hosted. Follow its next message one
+step at a time. Do not create or edit workspace rules unless I explicitly ask.
+```
+
+Other hosted clients should use the same server URL with OAuth when supported.
+Only clients that do not support OAuth should use a manually generated Webhound
+key in their bearer-token or `Authorization` advanced setting.
 
 Claude Code:
 
 ```bash
-claude mcp add --transport http webhound https://api.webhound.ai/api/v2/mcp --header "Authorization: Bearer wh_..."
+claude mcp add --transport http webhound https://api.webhound.ai/api/v2/mcp
 
 # Local stdio alternative:
-claude mcp add --transport stdio webhound --env WEBHOUND_KEY=wh_... -- npx -y webhound-mcp
+claude mcp add --transport stdio webhound --env WEBHOUND_KEY=wh_... -- npx -y webhound-mcp@0.5.0
 ```
 
 Codex:
@@ -146,7 +156,7 @@ Codex:
 ```toml
 [mcp_servers.webhound]
 command = "npx"
-args = ["-y", "webhound-mcp"]
+args = ["-y", "webhound-mcp@0.5.0"]
 
 [mcp_servers.webhound.env]
 WEBHOUND_KEY = "wh_..."
@@ -177,7 +187,7 @@ VS Code:
     "webhound": {
       "type": "stdio",
       "command": "npx",
-      "args": ["-y", "webhound-mcp"],
+      "args": ["-y", "webhound-mcp@0.5.0"],
       "env": {
         "WEBHOUND_KEY": "wh_..."
       }
@@ -208,14 +218,10 @@ Recommended setup defaults:
 - product: `report`
 - free run: enabled when available
 
-Onboarding can also help the calling agent save a local budget policy. The
-recommended lightweight policy is `$2` for quick scouting, `$5` for normal cited
-research, and `$10` for deeper or decision-driving work. The agent should ask
-where those rules should apply before writing anything: the current project,
-another accessible project, all relevant accessible projects with per-project
-rules, or global agent rules. It should not silently write Webhound rules into a
-temporary onboarding chat directory. Webhound itself still stores a single
-account default budget.
+`webhound_onboarding` returns one client-aware message, choices, and one next
+action. Hosted clients such as Manus must not create or edit workspace rules
+unless the user explicitly requests that separate action. Starting a report or
+dataset never triggers workspace-rule setup.
 
 New users may have one non-divisible free run pass. It covers one exact `$5` report or dataset. It can be used from the Webhound UI, API, hosted MCP, or this stdio MCP package.
 
@@ -227,23 +233,9 @@ Agents can read and update defaults with:
 - `webhound_get_defaults`
 - `webhound_set_defaults`
 
-During onboarding, agents should mention `webhound_help` for future questions
-about Webhound and `webhound_uninstall` if the user later wants to remove the
-MCP setup and local Webhound rules.
-
-Onboarding should ask one setup-timing question before the first run:
-
-- Set up this workspace first: ask where rules should apply, inspect only the
-  approved local context, propose Webhound usage rules plus a short budget
-  policy, save only approved rules, then start the first report or dataset.
-- Jump right in: ask what the user wants researched or extracted, start the
-  first report or dataset, then offer the same local setup pass while Webhound
-  works in the background.
-
-In both branches, onboarding should still walk the user all the way through
-starting the first Webhound session. After a first session starts, do not fall
-into a visible polling loop before handling the setup choice or scheduling a
-later check-in.
+If a user explicitly requests workspace rules, the agent must show the complete
+proposed content and exact destination before writing. After approval, it reads
+the file back and rejects empty or frontmatter-only content.
 
 ## Tool Flow
 
@@ -282,7 +274,7 @@ The core lifecycle is detached and visible:
     not bypass assembly: the revised budget becomes the stopping boundary, and
     Webhound runs normal final assembly afterward. Never do this merely because
     partial notes look sufficient or the run is taking time.
-11. When `done=true`, call `webhound_get_session` for the complete canonical session in one response. It includes prompts, messages, phases, tasks, agents, current and archived outputs, working documents, dataset rows, claims, sources, traces, notes, diagnostics, session usage history, and artifact links. It is uncapped and reports `complete_session=true`, `truncated=false`, and `omitted=[]`.
+11. When `done=true` and `output_ready=true`, call `webhound_get_session` for the complete canonical session in one response. If a terminal run has no output, treat its typed `EMPTY_OUTPUT` or `DATASET_ZERO_ROWS` alert as a failure rather than claiming success.
 12. `webhound_get_evidence_pack` returns that same complete session plus evidence-follow-up guidance. Use it when the answer depends on the research trail.
 13. Use `webhound_get_output` for the complete polished result or `webhound_export_session` when the user needs a file. Use the claims and sources tools when you need one focused surface.
 14. For datasets, inspect rows/schema plus sources; export CSV/JSON when the
@@ -306,6 +298,48 @@ through several waits while it uses the budget. More budget means more room for
 research before final assembly; it is not a signal for the calling agent to
 hurry the run. Do not send finalize/wrap-up guidance or stop the session just
 because partial working notes look usable.
+
+### Dataset schema forms
+
+Omit `schema` to let Webhound infer a concise schema. When fields matter, use
+exactly one of these forms.
+
+Native Webhound schema:
+
+```json
+{
+  "entity_name": "Company",
+  "attributes": [
+    { "name": "company_name", "type": "string", "is_primary": true },
+    { "name": "website", "type": "string", "standard_format": "url" },
+    { "name": "employee_count", "type": "number" }
+  ]
+}
+```
+
+Object JSON Schema:
+
+```json
+{
+  "type": "object",
+  "title": "Company",
+  "required": ["company_name"],
+  "properties": {
+    "company_name": {
+      "type": "string",
+      "description": "Official company name",
+      "x-webhound-primary": true
+    },
+    "website": { "type": "string", "format": "uri" },
+    "employee_count": { "type": "integer" }
+  }
+}
+```
+
+Native schemas require at least one `is_primary: true` field. For JSON Schema,
+`x-webhound-primary: true` wins; otherwise the first required property, then
+the first property, becomes the deterministic primary field. The start response
+echoes `normalized_schema` before the dataset begins.
 
 ## Public Tools
 
@@ -339,6 +373,10 @@ because partial working notes look usable.
 - `webhound_upload_file`
 - `webhound_account`
 - `webhound_diagnose`
+
+Supported upload formats are CSV, XLSX, XLS, PDF, DOCX, DOC, TXT, Markdown,
+and VTT. MIME type, filename extension, and recognizable file bytes are checked
+before the upload reaches Webhound.
 
 ## Completion And Diagnostics
 
@@ -388,6 +426,15 @@ Run the package self-test without credentials:
 
 ```bash
 npm run self-test
+npm test
+npm run release:check
+```
+
+Before publishing, compare this checkout with the canonical `webhound-server/mcp`
+runtime:
+
+```bash
+npm run parity:compare -- /absolute/path/to/webhound-server/mcp
 ```
 
 ## License

@@ -2,7 +2,7 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { createWebhoundMcpServer } from './server.mjs';
 
 export async function handleMcpHttpRequest(req, res, options = {}) {
-  const server = createWebhoundMcpServer(options);
+  const server = createWebhoundMcpServer({ ...options, allowLocalFiles: false });
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: undefined,
   });

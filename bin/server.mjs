@@ -31,6 +31,7 @@ async function runSelfTest() {
     apiKey: process.env.WEBHOUND_KEY || '',
     apiBase: process.env.WEBHOUND_API_BASE,
     appBase: process.env.WEBHOUND_APP_BASE,
+    allowLocalFiles: true,
   });
   const summary = {
     ok: true,
@@ -65,6 +66,7 @@ const server = createWebhoundMcpServer({
   apiKey: process.env.WEBHOUND_KEY || '',
   apiBase: process.env.WEBHOUND_API_BASE,
   appBase: process.env.WEBHOUND_APP_BASE,
+  allowLocalFiles: true,
 });
 
 const transport = new StdioServerTransport();

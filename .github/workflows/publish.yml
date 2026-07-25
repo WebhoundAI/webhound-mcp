@@ -6,7 +6,30 @@ on:
       - 'v*.*.*'
 
 jobs:
+  verify:
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['18.20.8', '20.19.5', '22.22.0', '23.11.1']
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Verify MCP contract
+        run: npm run release:check
+
   publish:
+    needs: verify
     runs-on: ubuntu-latest
     permissions:
       id-token: write
@@ -20,6 +43,7 @@ jobs:
         with:
           node-version: '22.22.0'
           registry-url: 'https://registry.npmjs.org'
+          cache: npm
 
       - name: Use npm with trusted publishing support
         run: npm install --global npm@11.15.0
@@ -27,8 +51,11 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Verify MCP server
-        run: npm run self-test
+      - name: Verify tag matches package version
+        run: node -e "const p=require('./package.json'); if (process.env.GITHUB_REF_NAME !== 'v'+p.version) throw new Error('tag/package version mismatch')"
+
+      - name: Re-run release gate
+        run: npm run release:check
 
       - name: Publish with provenance
         run: npm publish --access public
