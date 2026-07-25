@@ -34,12 +34,14 @@ function baseFake(overrides = {}) {
   };
 }
 
-test('all 30 tools publish dedicated closed output contracts', async (t) => {
+test('all 30 tools publish additive inputs and dedicated closed output contracts', async (t) => {
   const connection = await connectedClient(baseFake());
   t.after(() => connection.close());
   const { tools } = await connection.client.listTools();
   assert.equal(tools.length, TOOL_NAMES.length);
   for (const tool of tools) {
+    assert.equal(tool.inputSchema.type, 'object', `${tool.name} input is not an object`);
+    assert.equal(tool.inputSchema.additionalProperties, true, `${tool.name} rejects additive input fields`);
     assert.equal(tool.outputSchema.type, 'object', tool.name);
     assert.equal(tool.outputSchema.additionalProperties, false, `${tool.name} is an unconstrained passthrough`);
     assert.ok(tool.outputSchema.properties?.ok, `${tool.name} missing ok`);
@@ -217,11 +219,47 @@ test('all 30 tool handlers execute a schema-valid mocked happy path', async (t) 
   ];
   assert.deepEqual(calls.map(([name]) => name), TOOL_NAMES);
   for (const [name, args] of calls) {
-    const result = await connection.client.callTool({ name, arguments: args });
+    const result = await connection.client.callTool({
+      name,
+      arguments: {
+        ...args,
+        future_additive_probe: { client_version: 2, ignored_by_older_mcp: true },
+      },
+    });
     assert.equal(result.isError, false, `${name}: ${result.content?.[0]?.text || 'unexpected error'}`);
     assert.equal(result.structuredContent?.tool, name, `${name}: missing dedicated structured output`);
     assert.equal(result.structuredContent?.ok, true, `${name}: not ok`);
   }
+});
+
+test('additive top-level input fields are accepted but never forwarded upstream', async (t) => {
+  let forwarded = null;
+  const connection = await connectedClient(baseFake({
+    async setDefaults(input) {
+      forwarded = input;
+      return { ...input, research_harness: 'Hound' };
+    },
+  }));
+  t.after(() => connection.close());
+
+  const result = await connection.client.callTool({
+    name: 'webhound_set_defaults',
+    arguments: {
+      default_budget_usd: 7,
+      default_product: 'dataset',
+      use_free_run_when_available: false,
+      future_additive_probe: {
+        api_key: 'must-not-cross-the-boundary',
+      },
+    },
+  });
+
+  assert.equal(result.isError, false);
+  assert.deepEqual(forwarded, {
+    default_budget_usd: 7,
+    default_product: 'dataset',
+    use_free_run_when_available: false,
+  });
 });
 
 test('billing-required errors remain typed for start and non-start spend tools', async (t) => {

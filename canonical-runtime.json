@@ -5,7 +5,7 @@
   "files": {
     "bin/server.mjs": "39b356d5f927fb4a47910354d1c19856c87273ec19a2d42c9da43a7080112da9",
     "core/http.mjs": "c66d63c6ad630962b1f782ce5cdd853b39d5aa4e681e138c88ebe22af45a0c3d",
-    "core/server.mjs": "ad025ef4c522642d0cc3b677683fcef05923b6e95d8d284954b4c5e725478546",
+    "core/server.mjs": "135afc2485c4aa1461fe2610964d054319a830afbd5e88266eb3dbc791d9bd70",
     "core/webhoundClient.mjs": "88ee5e7c6753148f6dba3020007ba6f154b2297d00df9634b6bbc227d0ad00e4"
   }
 }

@@ -22962,9 +22962,11 @@ function completeToolConfig(name, config2 = {}) {
   const readOnly = existingAnnotations.readOnlyHint === true;
   const securitySchemes = config2.securitySchemes || WEBHOUND_OAUTH_SCHEMES;
   const outputSchema = config2.outputSchema || TOOL_OUTPUT_SCHEMAS[name];
+  const inputSchema = external_exports.object(config2.inputSchema || {}).passthrough();
   if (!outputSchema) throw new Error(`Missing dedicated output schema for ${name}`);
   return {
     ...config2,
+    inputSchema,
     outputSchema,
     securitySchemes,
     annotations: {
@@ -25029,10 +25031,11 @@ function normalizeToolResult(name, result) {
   };
 }
 function registerTool(server2, client, name, config2, handler) {
+  const inputParser = external_exports.object(config2.inputSchema || {}).strip();
   server2.registerTool(name, completeToolConfig(name, config2), async (args2) => {
     const previousToolContext = client?.setToolContext ? client.setToolContext(name, VERSION) : null;
     try {
-      return normalizeToolResult(name, await handler(args2 || {}));
+      return normalizeToolResult(name, await handler(inputParser.parse(args2 || {})));
     } catch (error2) {
       return normalizeToolResult(name, errorResult(error2, `${name} failed`));
     } finally {

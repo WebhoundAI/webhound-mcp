@@ -202,9 +202,11 @@ function completeToolConfig(name, config = {}) {
   const readOnly = existingAnnotations.readOnlyHint === true;
   const securitySchemes = config.securitySchemes || WEBHOUND_OAUTH_SCHEMES;
   const outputSchema = config.outputSchema || TOOL_OUTPUT_SCHEMAS[name];
+  const inputSchema = z.object(config.inputSchema || {}).passthrough();
   if (!outputSchema) throw new Error(`Missing dedicated output schema for ${name}`);
   return {
     ...config,
+    inputSchema,
     outputSchema,
     securitySchemes,
     annotations: {
@@ -2671,10 +2673,13 @@ function normalizeToolResult(name, result) {
 }
 
 function registerTool(server, client, name, config, handler) {
+  const inputParser = z.object(config.inputSchema || {}).strip();
   server.registerTool(name, completeToolConfig(name, config), async (args) => {
     const previousToolContext = client?.setToolContext ? client.setToolContext(name, VERSION) : null;
     try {
-      return normalizeToolResult(name, await handler(args || {}));
+      // Advertise additive-field tolerance to strict clients, but strip fields
+      // unknown to this MCP version before forwarding arguments to the API.
+      return normalizeToolResult(name, await handler(inputParser.parse(args || {})));
     } catch (error) {
       return normalizeToolResult(name, errorResult(error, `${name} failed`));
     } finally {
