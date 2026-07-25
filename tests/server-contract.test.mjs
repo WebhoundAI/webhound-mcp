@@ -57,6 +57,7 @@ test('all 30 tool handlers execute a schema-valid mocked happy path', async (t) 
     budget: 5,
     cost: 4.9,
     checked_at: '2026-07-25T00:00:00.000Z',
+    budget_control: null,
     alerts: [],
   };
   const fullSession = {

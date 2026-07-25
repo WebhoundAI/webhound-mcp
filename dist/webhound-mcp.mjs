@@ -22552,7 +22552,7 @@ var SESSION_OUTPUT_FIELDS = Object.freeze({
   dataset: FLEX_OBJECT.optional(),
   agents: FLEX_OBJECT.optional(),
   status_snapshot: FLEX_OBJECT.optional(),
-  budget_control: FLEX_OBJECT.optional(),
+  budget_control: FLEX_OBJECT.nullable().optional(),
   runtime_estimate: FLEX_OBJECT.optional(),
   followup_check_in: FLEX_OBJECT.optional(),
   sidecar_guidance: FLEX_OBJECT.optional(),
