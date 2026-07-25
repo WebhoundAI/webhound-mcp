@@ -28,7 +28,7 @@ async function hashesFor(base) {
 const packageJson = JSON.parse(await readFile(path.join(root, 'package.json'), 'utf8'));
 const current = {
   schema_version: 1,
-  canonical_source: 'Slingshot-Innovation/webhound-server:mcp',
+  canonical_source: 'WebhoundAI/webhound-server:mcp',
   package_version: packageJson.version,
   files: await hashesFor(root),
 };
