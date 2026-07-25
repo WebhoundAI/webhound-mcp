@@ -56,6 +56,7 @@ test('all 30 tool handlers execute a schema-valid mocked happy path', async (t) 
     completion_reason: 'natural_complete',
     budget: 5,
     cost: 4.9,
+    checked_at: '2026-07-25T00:00:00.000Z',
     alerts: [],
   };
   const fullSession = {
@@ -106,6 +107,8 @@ test('all 30 tool handlers execute a schema-valid mocked happy path', async (t) 
         cost: 0,
         normalized_schema: { entity_name: 'Company', attributes: [{ name: 'name', type: 'string', is_primary: true }] },
         schema_source: 'webhound_native',
+        schema_input_format: 'native',
+        schema_warnings: [],
       };
     },
     async watch() { return completed; },

@@ -274,6 +274,7 @@ const SESSION_OUTPUT_FIELDS = Object.freeze({
   completion_reason: z.string().nullable().optional(),
   budget: z.number().optional(),
   cost: z.number().optional(),
+  checked_at: z.string().optional(),
   credit_limit: z.number().optional(),
   total_spent: z.number().optional(),
   research_harness: z.string().optional(),
@@ -385,6 +386,8 @@ const TOOL_OUTPUT_SCHEMAS = Object.freeze({
     ...SESSION_OUTPUT_FIELDS,
     normalized_schema: FLEX_OBJECT.nullable().optional(),
     schema_source: z.enum(['webhound_native', 'json_schema', 'inferred']).optional(),
+    schema_input_format: z.enum(['native', 'json_schema', 'inferred']).optional(),
+    schema_warnings: z.array(z.string()).optional(),
   }),
   webhound_watch: toolOutputSchema('webhound_watch', {
     ...SESSION_OUTPUT_FIELDS,

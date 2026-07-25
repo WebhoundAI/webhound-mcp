@@ -22541,6 +22541,7 @@ var SESSION_OUTPUT_FIELDS = Object.freeze({
   completion_reason: external_exports.string().nullable().optional(),
   budget: external_exports.number().optional(),
   cost: external_exports.number().optional(),
+  checked_at: external_exports.string().optional(),
   credit_limit: external_exports.number().optional(),
   total_spent: external_exports.number().optional(),
   research_harness: external_exports.string().optional(),
@@ -22649,7 +22650,9 @@ var TOOL_OUTPUT_SCHEMAS = Object.freeze({
   webhound_start_dataset: toolOutputSchema("webhound_start_dataset", {
     ...SESSION_OUTPUT_FIELDS,
     normalized_schema: FLEX_OBJECT.nullable().optional(),
-    schema_source: external_exports.enum(["webhound_native", "json_schema", "inferred"]).optional()
+    schema_source: external_exports.enum(["webhound_native", "json_schema", "inferred"]).optional(),
+    schema_input_format: external_exports.enum(["native", "json_schema", "inferred"]).optional(),
+    schema_warnings: external_exports.array(external_exports.string()).optional()
   }),
   webhound_watch: toolOutputSchema("webhound_watch", {
     ...SESSION_OUTPUT_FIELDS
