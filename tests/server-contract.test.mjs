@@ -42,6 +42,82 @@ function baseFake(overrides = {}) {
   };
 }
 
+function richOnboardingPayload() {
+  const immediateNextMessage = 'Welcome to the complete onboarding flow. Before the first run, choose whether to set up this workspace first or jump right in.';
+  return {
+    onboarding_version: 'agent-led-2026-06-25',
+    account_state: {
+      authenticated: true,
+      ready_for_included_run: true,
+      defaults: {
+        default_budget_usd: 5,
+        agent_rules: { backend_account_rule_marker: true },
+      },
+    },
+    free_run: { available: true, included_value_usd: 5 },
+    billing: { credits: 0, has_card_on_file: false },
+    recommended_defaults: {
+      default_budget_usd: 5,
+      default_product: 'report',
+      use_free_run_when_available: true,
+    },
+    budget_model: {
+      rule_of_thumb: '$1 buys about 15 minutes of research.',
+      dollars_to_minutes: { '$5': 'about 75 minutes' },
+      backend_budget_marker: true,
+    },
+    agent_playbook: {
+      objective: 'backend-rich-objective',
+      interaction_style: {
+        mode: 'guided_setup',
+        first_response: immediateNextMessage,
+      },
+      principles: ['backend-rich-principle', 'Use $2 quick, $5 standard, and $10 deep.'],
+      next_actions: [{ goal: 'backend-rich-next-action' }],
+      conversation_flow: [{ step: 1, name: 'backend-rich-conversation-step', say: immediateNextMessage, wait_for_user: true }],
+      workspace_rules: {
+        should_offer_to_save: true,
+        suggested_rules: {
+          backend_workspace_rule_marker: true,
+          budget_policy: {
+            tiers: [
+              { amount_usd: 2, label: 'quick' },
+              { amount_usd: 5, label: 'standard' },
+              { amount_usd: 10, label: 'deep' },
+            ],
+            rule: 'Use $2 quick, $5 standard, and $10 deep.',
+          },
+        },
+        audit_rubric: ['backend-workspace-audit-marker'],
+        rule_targeting: { instruction: 'backend-workspace-target-marker' },
+      },
+    },
+    user_facing_guidance: {
+      immediate_next_message: immediateNextMessage,
+      first_run: 'backend-rich-first-run-guidance',
+      workspace_setup: 'backend-workspace-guidance-marker',
+      workspace_setup_timing: 'backend-workspace-timing-marker',
+      backend_user_guidance_marker: true,
+    },
+    immediate_next_message: immediateNextMessage,
+    setup_flow: [
+      'backend-rich-setup-first-or-jump-in with $2 quick, $5 standard, and $10 deep',
+      'backend-rich-watch-until-done',
+    ],
+    suggested_agent_rules: {
+      backend_suggested_agent_rule_marker: true,
+      budget_policy: {
+        tiers: [
+          { amount_usd: 2, label: 'quick' },
+          { amount_usd: 5, label: 'standard' },
+          { amount_usd: 10, label: 'deep' },
+        ],
+        rule: 'Use $2 quick, $5 standard, and $10 deep.',
+      },
+    },
+  };
+}
+
 function assertTextContentParity(result, label = 'tool result') {
   assert.equal(result.content?.length, 1, `${label}: expected one text content item`);
   assert.equal(result.content?.[0]?.type, 'text', `${label}: expected text content`);
@@ -421,6 +497,34 @@ test('degraded health and account probes preserve useful partial responses', asy
   assert.equal(accountText.authenticated, true);
   assert.equal(accountText.credits.credits, 10);
   assert.equal(accountText.usage.operation_count, 1);
+});
+
+test('account summary distinguishes the saved default from the standard onboarding run', async (t) => {
+  const connection = await connectedClient(baseFake({
+    async account() {
+      return {
+        authenticated: true,
+        credits: { credits: 5, available_credits: 5, reserved_credits: 0 },
+        usage: {},
+        defaults: { default_budget_usd: 20, default_product: 'report', use_free_run_when_available: false },
+        free_run: { available: false },
+        credit_balance_usd: 5,
+        available_credit_balance_usd: 5,
+        reserved_credit_balance_usd: 0,
+        credit_availability_verified: true,
+        can_start_default_run: false,
+        can_start_any_onboarding_run: true,
+        can_start_standard_onboarding_run: true,
+        billing_configured_for_uninterrupted_runs: false,
+      };
+    },
+  }));
+  t.after(() => connection.close());
+  const account = await connection.client.callTool({ name: 'webhound_account', arguments: {} });
+  assert.match(account.structuredContent.summary, /Saved default run ready now: no/i);
+  assert.match(account.structuredContent.summary, /fully funded \$1\+ onboarding run ready now: yes/i);
+  assert.match(account.structuredContent.summary, /Standard \$5 onboarding run ready now: yes/i);
+  assert.doesNotMatch(account.structuredContent.summary, /Default \$5 run ready now/i);
 });
 
 test('MCP dataset input accepts every backend-supported native field and alias', async (t) => {
@@ -1265,16 +1369,155 @@ test('empty export bytes never produce a complete delivery flag', async (t) => {
   assert.equal(result.structuredContent.ok, false);
 });
 
-test('hosted onboarding is compact and start responses contain no rule-writing payload', async (t) => {
+test('local-agent onboarding preserves rich backend guidance behind one executable branch-aware flow', async (t) => {
   const connection = await connectedClient(baseFake({
     async onboarding() {
-      return {
-        account_state: { authenticated: true, ready_for_included_run: true },
-        free_run: { available: true },
-        billing: { credits: 0 },
-        recommended_defaults: { default_budget_usd: 5, default_product: 'report', use_free_run_when_available: true },
-        agent_playbook: { workspace_rules: { should_offer_to_save: true } },
-      };
+      return richOnboardingPayload();
+    },
+  }));
+  t.after(() => connection.close());
+
+  for (const client of ['codex', 'claude_code', 'cursor', 'opencode', 'claude_desktop', 'vscode', 'antigravity', 'windsurf', 'cline', 'local']) {
+    const onboarding = await connection.client.callTool({
+      name: 'webhound_onboarding',
+      arguments: { client },
+    });
+    assert.equal(onboarding.isError, false, client);
+    assert.equal(onboarding.structuredContent.client, client);
+    assert.equal(onboarding.structuredContent.client_mode, 'local_agent');
+    assert.equal(onboarding.structuredContent.flow_version, 2);
+    assert.equal(onboarding.structuredContent.onboarding_version, 'agent-led-rich-2026-07-25');
+    assert.equal(onboarding.structuredContent.flow_sequence.canonical, 'agent_playbook.conversation_flow');
+    assert.equal(onboarding.structuredContent.flow_sequence.setup_flow_role, 'reference_only');
+    assert.equal(onboarding.structuredContent.flow_sequence.next_action_role, 'entry_instruction_only');
+    assert.match(onboarding.structuredContent.flow_sequence.consumed_entry_rule, /already consumed/i);
+    assert.match(onboarding.structuredContent.flow_sequence.resume_rule, /next unconsumed/i);
+    assert.equal(onboarding.structuredContent.budget_model.backend_budget_marker, undefined);
+    assert.equal(onboarding.structuredContent.agent_playbook.objective, 'backend-rich-objective');
+    assert.equal(onboarding.structuredContent.agent_playbook.interaction_style.first_response, undefined);
+    const flow = onboarding.structuredContent.agent_playbook.conversation_flow;
+    assert.equal(flow.every(entry => typeof entry.wait_for_user === 'boolean'), true, `${client} has a non-boolean wait_for_user`);
+    assert.equal(flow[0].name, 'Choose setup timing');
+    assert.deepEqual(flow[0].choices, ['setup_first', 'jump_in']);
+    assert.equal(flow[0].wait_for_user, true);
+    const setupTargetIndex = flow.findIndex(entry => entry.name === 'Choose and approve inspection target');
+    const setupProposalIndex = flow.findIndex(entry => entry.name === 'Propose exact local rules');
+    const setupWriteIndex = flow.findIndex(entry => entry.name === 'Save and verify approved rules');
+    const requestIndex = flow.findIndex(entry => entry.name === 'Collect the first research request');
+    const startIndex = flow.findIndex(entry => entry.name === 'Start the first research run');
+    const jumpOfferIndex = flow.findIndex(entry => entry.name === 'Offer optional local setup');
+    const jumpTargetIndex = flow.findIndex(entry => entry.name === 'Choose and approve optional inspection target');
+    const jumpProposalIndex = flow.findIndex(entry => entry.name === 'Propose optional rules');
+    const jumpWriteIndex = flow.findIndex(entry => entry.name === 'Save and verify optional rules');
+    const watchIndex = flow.findIndex(entry => entry.name === 'Watch to honest completion');
+    const resultIndex = flow.findIndex(entry => entry.name === 'Return result and evidence');
+    assert.equal(setupTargetIndex < setupProposalIndex && setupProposalIndex < setupWriteIndex && setupWriteIndex < requestIndex, true);
+    assert.equal(requestIndex < startIndex && startIndex < jumpOfferIndex, true);
+    assert.equal(jumpOfferIndex < jumpTargetIndex && jumpTargetIndex < jumpProposalIndex && jumpProposalIndex < jumpWriteIndex, true);
+    assert.equal(jumpWriteIndex < watchIndex && watchIndex < resultIndex, true);
+    assert.equal(flow[setupTargetIndex].wait_for_user, true);
+    assert.equal(flow[setupProposalIndex].wait_for_user, true);
+    assert.equal(flow[setupWriteIndex].wait_for_user, false);
+    assert.equal(flow[requestIndex].wait_for_user, true);
+    assert.equal(flow[startIndex].wait_for_user, false);
+    assert.match(flow[startIndex].say, /exactly the budget established/i);
+    assert.match(flow[startIndex].say, /never substitute a saved default/i);
+    assert.match(flow[jumpOfferIndex].say, /skip every remaining jump_in_setup entry and continue to Watch/i);
+    assert.equal(flow[jumpTargetIndex].wait_for_user, true);
+    assert.equal(flow[jumpProposalIndex].wait_for_user, true);
+    assert.equal(flow[jumpWriteIndex].wait_for_user, false);
+    assert.equal(onboarding.structuredContent.user_facing_guidance.backend_user_guidance_marker, undefined);
+    assert.equal(onboarding.structuredContent.user_facing_guidance.immediate_next_message, undefined);
+    assert.equal(onboarding.structuredContent.setup_flow.length, 4);
+    assert.match(onboarding.structuredContent.setup_flow[0], /only executable sequence/i);
+    assert.match(onboarding.structuredContent.setup_flow[2], /\$20.*300 minutes or 5 hours/i);
+    assert.equal(onboarding.structuredContent.suggested_agent_rules, undefined);
+    const suggestedRules = onboarding.structuredContent.agent_playbook.workspace_rules.suggested_rules;
+    assert.equal(suggestedRules.backend_workspace_rule_marker, true);
+    assert.equal(
+      suggestedRules.budget_policy.tiers.some(tier => tier.amount_usd === 20 && tier.estimated_minutes === 300),
+      true
+    );
+    assert.equal(suggestedRules.budget_policy.tiers_are_caps, false);
+    assert.equal(onboarding.structuredContent.account_state.defaults.agent_rules, undefined);
+    assert.equal(onboarding.structuredContent.recommended_defaults.agent_rules, undefined);
+    assert.match(JSON.stringify(onboarding.structuredContent.agent_playbook.principles), /\$20.*not caps/i);
+    assert.deepEqual(onboarding.structuredContent.choices.map(choice => choice.id), ['setup_first', 'jump_in']);
+    assert.match(onboarding.structuredContent.message, /\$1 buys about 15 minutes/i);
+    assert.match(onboarding.structuredContent.message, /\$5 standard \(about 75 minutes\)/i);
+    assert.match(onboarding.structuredContent.message, /\$20 exhaustive\/highest-stakes \(about 300 minutes or 5 hours\)/i);
+    assert.match(onboarding.structuredContent.message, /not caps/i);
+    assert.match(onboarding.content[0].text, /\$1 buys about 15 minutes/i);
+    assert.match(onboarding.content[0].text, /\$5 standard \(about 75 minutes\)/i);
+    assert.match(onboarding.content[0].text, /\$20 exhaustive\/highest-stakes \(about 300 minutes or 5 hours\)/i);
+    assert.match(onboarding.structuredContent.next_action, /drop onboarding/i);
+    assert.notEqual(onboarding.structuredContent.summary, onboarding.structuredContent.message);
+    assert.equal(flow[0].say, onboarding.structuredContent.immediate_next_message);
+    assert.equal(onboarding.structuredContent.message, onboarding.structuredContent.immediate_next_message);
+    assert.ok(Buffer.byteLength(onboarding.content[0].text) <= 32 * 1024, `${client} onboarding text exceeds 32 KiB`);
+  }
+});
+
+test('onboarding defaults omitted or generic client identity to a filesystem-safe research flow', async (t) => {
+  const connection = await connectedClient(baseFake({
+    async onboarding() {
+      return richOnboardingPayload();
+    },
+  }));
+  t.after(() => connection.close());
+
+  for (const argumentsValue of [{}, { client: 'generic' }]) {
+    const onboarding = await connection.client.callTool({
+      name: 'webhound_onboarding',
+      arguments: argumentsValue,
+    });
+    assert.equal(onboarding.isError, false);
+    assert.equal(onboarding.structuredContent.client, 'generic');
+    assert.equal(onboarding.structuredContent.client_mode, 'safe_default');
+    assert.deepEqual(onboarding.structuredContent.choices.map(choice => choice.id), ['report', 'dataset']);
+    assert.equal(onboarding.structuredContent.agent_playbook.workspace_rules, undefined);
+    assert.equal(onboarding.structuredContent.user_facing_guidance.workspace_setup, undefined);
+    assert.equal(onboarding.structuredContent.user_facing_guidance.workspace_setup_timing, undefined);
+    assert.equal(onboarding.structuredContent.account_state.defaults.agent_rules, undefined);
+    assert.equal(onboarding.structuredContent.suggested_agent_rules, undefined);
+    assert.equal(onboarding.structuredContent.workspace_rules, undefined);
+    assert.equal(onboarding.structuredContent.hosted_safety.workspace_or_filesystem_setup_skipped, true);
+    assert.equal(onboarding.structuredContent.hosted_safety.automatic_workspace_or_filesystem_writes_allowed, false);
+    assert.doesNotMatch(JSON.stringify(onboarding.structuredContent), /backend-workspace-(?:guidance|timing|audit|target)-marker/i);
+    assert.ok(Buffer.byteLength(onboarding.content[0].text) <= 16 * 1024, 'default safe onboarding text exceeds 16 KiB');
+  }
+});
+
+test('onboarding budget tiers preserve $5 = 75 minutes and add uncapped $20 = 300 minutes', async (t) => {
+  const connection = await connectedClient(baseFake({
+    async onboarding() {
+      return richOnboardingPayload();
+    },
+  }));
+  t.after(() => connection.close());
+  const onboarding = await connection.client.callTool({
+    name: 'webhound_onboarding',
+    arguments: { client: 'codex' },
+  });
+  const summary = onboarding.structuredContent.budget_summary;
+  const twentyDollarTier = summary.recommended_starting_points.find(tier => tier.amount_usd === 20);
+  assert.equal(summary.minutes_per_dollar, 15);
+  assert.equal(summary.standard_default_budget_usd, 5);
+  assert.equal(summary.standard_default_research_minutes, 75);
+  assert.equal(twentyDollarTier.estimated_minutes, 300);
+  assert.equal(twentyDollarTier.estimated_hours, 5);
+  assert.equal(twentyDollarTier.label, 'exhaustive/highest-stakes');
+  assert.equal(summary.tiers_are_caps, false);
+  assert.match(summary.custom_budget_guidance, /larger custom budget/i);
+  assert.equal(onboarding.structuredContent.budget_model.dollars_to_minutes['$5'], 'about 75 minutes');
+  assert.equal(onboarding.structuredContent.budget_model.dollars_to_minutes['$20'], 'about 300 minutes (5 hours)');
+  assert.equal(onboarding.structuredContent.budget_model.tiers_are_caps, false);
+});
+
+test('hosted onboarding keeps the research flow, strips implicit rule setup, and leaves start responses clean', async (t) => {
+  const connection = await connectedClient(baseFake({
+    async onboarding() {
+      return richOnboardingPayload();
     },
     async startReport() {
       return { session_id: 'report-1', budget: 5, cost: 0, free_run: { reserved: true } };
@@ -1286,9 +1529,36 @@ test('hosted onboarding is compact and start responses contain no rule-writing p
     arguments: { client: 'hosted' },
   });
   assert.equal(onboarding.structuredContent.client_mode, 'hosted_oauth');
-  assert.equal(onboarding.structuredContent.agent_playbook, undefined);
+  assert.equal(onboarding.structuredContent.agent_playbook.objective.length > 0, true);
+  assert.equal(onboarding.structuredContent.agent_playbook.workspace_rules, undefined);
+  assert.equal(onboarding.structuredContent.agent_playbook.conversation_flow.length >= 4, true);
+  assert.match(JSON.stringify(onboarding.structuredContent.agent_playbook.principles), /sidecar.*webhound_add_sidecar_notes/i);
+  const hostedFlow = onboarding.structuredContent.agent_playbook.conversation_flow;
+  assert.equal(hostedFlow.every(entry => typeof entry.wait_for_user === 'boolean'), true);
+  assert.equal(hostedFlow[0].say, onboarding.structuredContent.immediate_next_message);
+  assert.equal(hostedFlow[0].wait_for_user, true);
+  assert.match(hostedFlow[0].say, /cited report or a sourced dataset/i);
+  assert.match(hostedFlow[0].say, /what you want researched and any scope/i);
+  const customFundingEntry = hostedFlow.find(entry => entry.name === 'Verify selected budget funding');
+  const hostedStartEntry = hostedFlow.find(entry => entry.tool === 'webhound_start_report or webhound_start_dataset');
+  assert.equal(customFundingEntry.tool, 'webhound_account');
+  assert.match(customFundingEntry.say, /Always call webhound_account/i);
+  assert.match(customFundingEntry.say, /available_credit_balance_usd.*selected budget/i);
+  assert.equal(hostedStartEntry.wait_for_user, false);
+  assert.match(hostedStartEntry.say, /without asking again/i);
+  assert.equal(onboarding.structuredContent.user_facing_guidance.workspace_setup, undefined);
+  assert.equal(onboarding.structuredContent.user_facing_guidance.workspace_setup_timing, undefined);
+  assert.equal(onboarding.structuredContent.account_state.defaults.agent_rules, undefined);
+  assert.equal(onboarding.structuredContent.suggested_agent_rules, undefined);
   assert.equal(onboarding.structuredContent.workspace_rules, undefined);
-  assert.match(onboarding.structuredContent.next_action, /drop this onboarding step/i);
+  assert.equal(onboarding.structuredContent.hosted_safety.workspace_or_filesystem_setup_skipped, true);
+  assert.equal(onboarding.structuredContent.hosted_safety.automatic_workspace_or_filesystem_writes_allowed, false);
+  assert.deepEqual(onboarding.structuredContent.choices.map(choice => choice.id), ['report', 'dataset']);
+  assert.match(onboarding.structuredContent.message, /\$5 standard \(about 75 minutes\)/i);
+  assert.match(onboarding.structuredContent.message, /\$20 exhaustive\/highest-stakes \(about 300 minutes or 5 hours\)/i);
+  assert.doesNotMatch(JSON.stringify(onboarding.structuredContent), /backend-workspace-(?:guidance|timing|audit|target)-marker/i);
+  assert.match(onboarding.structuredContent.next_action, /drop onboarding/i);
+  assert.ok(Buffer.byteLength(onboarding.content[0].text) <= 16 * 1024, 'default hosted onboarding text exceeds 16 KiB');
 
   const started = await connection.client.callTool({
     name: 'webhound_start_report',
@@ -1297,6 +1567,278 @@ test('hosted onboarding is compact and start responses contain no rule-writing p
   assert.equal(started.isError, false);
   assert.equal(started.structuredContent.onboarding_workspace_rule_prompt, undefined);
   assert.doesNotMatch(started.content[0].text, /workspace rules|setup pass/i);
+});
+
+test('blocked local and hosted onboarding progress through account verification to start, wait, and evidence', async (t) => {
+  const connection = await connectedClient(baseFake({
+    async onboarding() {
+      return {
+        account_state: { authenticated: true, ready_for_included_run: false, ready_for_paid_runs: false },
+        recommended_defaults: { default_budget_usd: 5, default_product: 'report', use_free_run_when_available: true },
+        free_run: { available: false },
+        billing: { credits: 0, has_card_on_file: false, auto_recharge_enabled: false },
+        agent_playbook: { workspace_rules: { should_offer_to_save: true } },
+      };
+    },
+  }));
+  t.after(() => connection.close());
+
+  for (const client of ['codex', 'hosted']) {
+    const onboarding = await connection.client.callTool({ name: 'webhound_onboarding', arguments: { client } });
+    assert.equal(onboarding.isError, false, client);
+    assert.equal(onboarding.structuredContent.step, 'unblock_billing', client);
+    assert.deepEqual(onboarding.structuredContent.choices.map(choice => choice.id), ['billing_ready'], client);
+    assert.equal(onboarding.structuredContent.billing_url, 'https://www.webhound.ai/billing', client);
+    const flow = onboarding.structuredContent.agent_playbook.conversation_flow;
+    assert.equal(flow[0].say, onboarding.structuredContent.immediate_next_message, client);
+    assert.equal(flow[0].wait_for_user, true, client);
+    const accountIndex = flow.findIndex(entry => String(entry.tool).startsWith('webhound_account'));
+    const startIndex = flow.findIndex(entry => entry.tool === 'webhound_start_report or webhound_start_dataset');
+    const waitIndex = flow.findIndex(entry => entry.tool === 'webhound_wait');
+    const evidenceIndex = flow.findIndex(entry => entry.tool === 'webhound_get_evidence_pack');
+    assert.equal(accountIndex > 0, true, client);
+    assert.equal(accountIndex < startIndex && startIndex < waitIndex && waitIndex < evidenceIndex, true, client);
+    assert.match(flow[accountIndex].say, /can_start_any_onboarding_run=true/i, client);
+    assert.equal(flow[startIndex].wait_for_user, false, client);
+    assert.match(onboarding.structuredContent.next_action, /next unconsumed conversation_flow entry/i, client);
+  }
+});
+
+test('saved free-run opt-out requires explicit one-run consent in local and hosted onboarding', async (t) => {
+  const connection = await connectedClient(baseFake({
+    async onboarding() {
+      return {
+        account_state: {
+          authenticated: true,
+          ready_for_included_run: true,
+          included_run_auto_use_enabled: false,
+          ready_for_paid_runs: false,
+          defaults: { use_free_run_when_available: false },
+        },
+        recommended_defaults: { default_budget_usd: 5, default_product: 'report', use_free_run_when_available: false },
+        free_run: { available: true, included_value_usd: 5 },
+        billing: { credits: 0, has_card_on_file: false, auto_recharge_enabled: false },
+        agent_playbook: { workspace_rules: { should_offer_to_save: true } },
+      };
+    },
+  }));
+  t.after(() => connection.close());
+
+  for (const client of ['codex', 'hosted']) {
+    const onboarding = await connection.client.callTool({ name: 'webhound_onboarding', arguments: { client } });
+    assert.equal(onboarding.isError, false, client);
+    assert.equal(onboarding.structuredContent.step, 'choose_funding', client);
+    assert.equal(onboarding.structuredContent.account_state.included_run_available, true, client);
+    assert.equal(onboarding.structuredContent.account_state.included_run_auto_use_enabled, false, client);
+    assert.equal(onboarding.structuredContent.account_state.can_start_default_paid_run, false, client);
+    assert.equal(onboarding.structuredContent.account_state.can_start_default_run, false, client);
+    assert.deepEqual(onboarding.structuredContent.choices.map(choice => choice.id), ['use_included_run', 'billing_ready'], client);
+    assert.match(onboarding.structuredContent.message, /will not consume it unless you explicitly choose/i, client);
+    assert.match(onboarding.structuredContent.next_action, /explicit consent for one exact \$5/i, client);
+    const flow = onboarding.structuredContent.agent_playbook.conversation_flow;
+    assert.deepEqual(flow[0].choices, ['use_included_run', 'billing_ready'], client);
+    assert.match(flow[1].say, /use_included_run/i, client);
+    assert.match(flow[1].say, /use_free_run_when_available=true/i, client);
+    assert.match(flow[1].say, /exactly one \$5 report or dataset/i, client);
+    assert.equal(flow.some(entry => entry.tool === 'webhound_start_report or webhound_start_dataset'), true, client);
+    const startEntry = flow.find(entry => entry.tool === 'webhound_start_report or webhound_start_dataset');
+    const customFundingEntry = flow.find(entry => entry.name === 'Verify selected budget funding');
+    assert.match(startEntry.say, /exactly the budget established|artifact, topic, scope, and budget established/i, client);
+    assert.match(startEntry.say, /never substitute a saved default/i, client);
+    assert.match(customFundingEntry.say, /included pass never funds any other amount/i, client);
+    assert.match(customFundingEntry.say, /available_credit_balance_usd.*selected budget/i, client);
+    assert.doesNotMatch(JSON.stringify(onboarding.structuredContent.agent_playbook), /start the chosen report or dataset with the included \$5 run/i, client);
+  }
+});
+
+test('stored credits make one paid run ready without claiming uninterrupted billing', async (t) => {
+  const connection = await connectedClient(baseFake({
+    async onboarding() {
+      return {
+        account_state: { authenticated: true, ready_for_included_run: false, ready_for_paid_runs: true },
+        recommended_defaults: { default_budget_usd: 5, default_product: 'report', use_free_run_when_available: true },
+        free_run: { available: false },
+        billing: {
+          credits: 10,
+          available_credits: 10,
+          reserved_credits: 0,
+          credit_availability_verified: true,
+          has_card_on_file: false,
+          auto_recharge_enabled: false,
+        },
+      };
+    },
+  }));
+  t.after(() => connection.close());
+  const onboarding = await connection.client.callTool({ name: 'webhound_onboarding', arguments: { client: 'codex' } });
+  assert.equal(onboarding.structuredContent.account_state.can_start_default_paid_run, true);
+  assert.equal(onboarding.structuredContent.account_state.can_start_default_run, true);
+  assert.equal(onboarding.structuredContent.account_state.billing_configured_for_uninterrupted_runs, false);
+  assert.doesNotMatch(onboarding.structuredContent.message, /without consuming the pass/i);
+});
+
+test('saved default readiness stays distinct from the standard $5 onboarding run', async (t) => {
+  const connection = await connectedClient(baseFake({
+    async onboarding() {
+      return {
+        account_state: {
+          authenticated: true,
+          defaults: { default_budget_usd: 20, default_product: 'report', use_free_run_when_available: false },
+          can_start_default_paid_run: false,
+          can_start_default_run: false,
+          can_start_standard_onboarding_paid_run: true,
+          can_start_standard_onboarding_run: true,
+        },
+        recommended_defaults: { default_budget_usd: 20, default_product: 'report', use_free_run_when_available: false },
+        free_run: { available: false },
+        billing: {
+          credits: 5,
+          available_credits: 5,
+          reserved_credits: 0,
+          credit_availability_verified: true,
+          has_card_on_file: false,
+          auto_recharge_enabled: false,
+        },
+      };
+    },
+  }));
+  t.after(() => connection.close());
+  const onboarding = await connection.client.callTool({ name: 'webhound_onboarding', arguments: { client: 'hosted' } });
+  assert.equal(onboarding.structuredContent.account_state.can_start_default_paid_run, false);
+  assert.equal(onboarding.structuredContent.account_state.can_start_default_run, false);
+  assert.equal(onboarding.structuredContent.account_state.can_start_standard_onboarding_paid_run, true);
+  assert.equal(onboarding.structuredContent.account_state.can_start_standard_onboarding_run, true);
+  assert.equal(onboarding.structuredContent.step, 'choose_first_artifact');
+  assert.match(
+    onboarding.structuredContent.agent_playbook.conversation_flow.find(entry => entry.tool === 'webhound_start_report or webhound_start_dataset').say,
+    /never substitute a saved default/i
+  );
+});
+
+test('verified partial credits can start a smaller fully funded onboarding run without pretending $5 is ready', async (t) => {
+  const connection = await connectedClient(baseFake({
+    async onboarding() {
+      return {
+        account_state: {
+          authenticated: true,
+          defaults: { default_budget_usd: 5, default_product: 'report', use_free_run_when_available: false },
+        },
+        recommended_defaults: { default_budget_usd: 5, default_product: 'report', use_free_run_when_available: false },
+        free_run: { available: false },
+        billing: {
+          credits: 2,
+          available_credits: 2,
+          reserved_credits: 0,
+          credit_availability_verified: true,
+          has_card_on_file: false,
+          auto_recharge_enabled: false,
+        },
+      };
+    },
+  }));
+  t.after(() => connection.close());
+  const onboarding = await connection.client.callTool({ name: 'webhound_onboarding', arguments: { client: 'hosted' } });
+  assert.equal(onboarding.structuredContent.account_state.minimum_supported_budget_usd, 1);
+  assert.equal(onboarding.structuredContent.account_state.can_start_any_onboarding_paid_run, true);
+  assert.equal(onboarding.structuredContent.account_state.can_start_any_onboarding_run, true);
+  assert.equal(onboarding.structuredContent.account_state.can_start_standard_onboarding_paid_run, false);
+  assert.equal(onboarding.structuredContent.account_state.can_start_standard_onboarding_run, false);
+  assert.equal(onboarding.structuredContent.step, 'choose_first_artifact');
+  assert.deepEqual(onboarding.structuredContent.choices.map(choice => choice.id), ['report', 'dataset']);
+  assert.equal(onboarding.structuredContent.billing_url, null);
+  assert.match(onboarding.structuredContent.message, /\$2\.00 in verified available credits/i);
+  assert.match(onboarding.structuredContent.message, /from \$1 up to \$2\.00/i);
+  assert.match(onboarding.structuredContent.message, /choose the first-run budget explicitly/i);
+  assert.doesNotMatch(onboarding.structuredContent.message, /first onboarding run defaults to \$5|recommended first-run default is \$5/i);
+  assert.doesNotMatch(onboarding.structuredContent.message, /open Webhound Billing, then tell me/i);
+  const flow = onboarding.structuredContent.agent_playbook.conversation_flow;
+  const fundingEntry = flow.find(entry => entry.name === 'Verify selected budget funding');
+  const startEntry = flow.find(entry => entry.tool === 'webhound_start_report or webhound_start_dataset');
+  assert.equal(fundingEntry.tool, 'webhound_account');
+  assert.doesNotMatch(String(fundingEntry.when || ''), /budget other than exactly \$5/i);
+  assert.match(fundingEntry.say, /available_credit_balance_usd at least the selected budget/i);
+  assert.match(fundingEntry.say, /selected budget is not fully covered.*billing/i);
+  assert.doesNotMatch(startEntry.say, /budget=5 explicitly/i);
+  assert.match(startEntry.say, /never.*assume \$5/i);
+  assert.match(startEntry.say, /launch an amount the funding check did not cover/i);
+});
+
+test('partial paid credits do not force consumption of an opted-out included pass', async (t) => {
+  const connection = await connectedClient(baseFake({
+    async onboarding() {
+      return {
+        account_state: {
+          authenticated: true,
+          defaults: { default_budget_usd: 5, default_product: 'report', use_free_run_when_available: false },
+          included_run_auto_use_enabled: false,
+        },
+        recommended_defaults: { default_budget_usd: 5, default_product: 'report', use_free_run_when_available: false },
+        free_run: { available: true, included_value_usd: 5 },
+        billing: {
+          credits: 2,
+          available_credits: 2,
+          reserved_credits: 0,
+          credit_availability_verified: true,
+          has_card_on_file: false,
+          auto_recharge_enabled: false,
+        },
+      };
+    },
+  }));
+  t.after(() => connection.close());
+  const onboarding = await connection.client.callTool({ name: 'webhound_onboarding', arguments: { client: 'hosted' } });
+  assert.equal(onboarding.structuredContent.account_state.included_run_auto_use_enabled, false);
+  assert.equal(onboarding.structuredContent.account_state.can_start_any_onboarding_run, true);
+  assert.equal(onboarding.structuredContent.account_state.can_start_standard_onboarding_run, false);
+  assert.equal(onboarding.structuredContent.step, 'choose_first_artifact');
+  assert.deepEqual(onboarding.structuredContent.choices.map(choice => choice.id), ['report', 'dataset']);
+  assert.match(onboarding.structuredContent.message, /included \$5 run is available, but automatic use is disabled/i);
+  assert.match(onboarding.structuredContent.message, /without consuming the included pass/i);
+});
+
+test('active reservations prevent false onboarding readiness from gross credits', async (t) => {
+  const connection = await connectedClient(baseFake({
+    async onboarding() {
+      return {
+        account_state: {
+          authenticated: true,
+          defaults: { default_budget_usd: 5, default_product: 'report', use_free_run_when_available: false },
+        },
+        recommended_defaults: { default_budget_usd: 5, default_product: 'report', use_free_run_when_available: false },
+        free_run: { available: false },
+        billing: {
+          credits: 5,
+          available_credits: 0,
+          reserved_credits: 5,
+          credit_availability_verified: true,
+          has_card_on_file: false,
+          auto_recharge_enabled: false,
+        },
+      };
+    },
+  }));
+  t.after(() => connection.close());
+  const onboarding = await connection.client.callTool({ name: 'webhound_onboarding', arguments: { client: 'hosted' } });
+  assert.equal(onboarding.structuredContent.account_state.credit_balance_usd, 5);
+  assert.equal(onboarding.structuredContent.account_state.available_credit_balance_usd, 0);
+  assert.equal(onboarding.structuredContent.account_state.can_start_default_run, false);
+  assert.equal(onboarding.structuredContent.account_state.can_start_standard_onboarding_run, false);
+  assert.equal(onboarding.structuredContent.step, 'unblock_billing');
+});
+
+test('partial set-defaults calls forward only fields the user supplied', async (t) => {
+  let forwarded = null;
+  const connection = await connectedClient(baseFake({
+    async setDefaults(input) {
+      forwarded = input;
+      return { default_budget_usd: input.default_budget_usd, default_product: 'dataset', use_free_run_when_available: false, research_harness: 'Hound' };
+    },
+  }));
+  t.after(() => connection.close());
+  const result = await connection.client.callTool({ name: 'webhound_set_defaults', arguments: { default_budget_usd: 7 } });
+  assert.equal(result.isError, false);
+  assert.deepEqual(forwarded, { default_budget_usd: 7 });
+  assert.equal(result.structuredContent.use_free_run_when_available, false);
 });
 
 test('onboarding tolerates additive top-level and nested capability fields', async (t) => {
@@ -1340,7 +1882,30 @@ test('onboarding tolerates additive top-level and nested capability fields', asy
   assert.equal(explicitlyRequested.isError, false);
   assert.equal(explicitlyRequested.structuredContent.workspace_rules.requested, true);
   assert.equal(explicitlyRequested.structuredContent.workspace_rules.supported, true);
+  assert.equal(explicitlyRequested.structuredContent.workspace_rules.approval_required, true);
+  assert.equal(explicitlyRequested.structuredContent.workspace_rules.automatic_write_allowed, false);
+  assert.equal(explicitlyRequested.structuredContent.workspace_rules.exact_destination_required, true);
+  assert.equal(explicitlyRequested.structuredContent.workspace_rules.complete_content_preview_required, true);
+  assert.equal(explicitlyRequested.structuredContent.workspace_rules.read_back_required, true);
+  assert.equal(explicitlyRequested.structuredContent.workspace_rules.reject_empty_or_frontmatter_only, true);
+  assert.equal(explicitlyRequested.structuredContent.hosted_safety.automatic_workspace_or_filesystem_writes_allowed, false);
+  assert.equal(explicitlyRequested.structuredContent.suggested_agent_rules, undefined);
   assert.match(explicitlyRequested.structuredContent.workspace_rules.instruction, /exact destination/i);
+  assert.match(JSON.stringify(explicitlyRequested.structuredContent.agent_playbook), /top-level workspace_rules approval contract/i);
+  assert.doesNotMatch(JSON.stringify(explicitlyRequested.structuredContent.agent_playbook), /Do not create, edit, or inspect workspace or filesystem rules/i);
+  assert.ok(Buffer.byteLength(explicitlyRequested.content[0].text) <= 24 * 1024, 'explicit hosted rule-guidance text exceeds 24 KiB');
+
+  const localExplicit = await connection.client.callTool({
+    name: 'webhound_onboarding',
+    arguments: {
+      client: 'codex',
+      workspace_rules_requested: true,
+      capabilities: { workspace_rules_supported: true },
+    },
+  });
+  assert.equal(localExplicit.structuredContent.workspace_rules.details_path, 'agent_playbook.workspace_rules');
+  assert.equal(localExplicit.structuredContent.workspace_rules.suggested_rules, undefined);
+  assert.ok(Buffer.byteLength(localExplicit.content[0].text) <= 32 * 1024, 'explicit local rule-guidance text exceeds 32 KiB');
 });
 
 test('onboarding preserves account-state credits when billing has no balance', async (t) => {
@@ -1365,6 +1930,32 @@ test('onboarding preserves account-state credits when billing has no balance', a
   assert.equal(onboarding.isError, false);
   assert.equal(onboarding.structuredContent.account_state.credit_balance_usd, 2);
   assert.match(onboarding.structuredContent.message, /\$2\.00/);
+});
+
+test('onboarding treats configured paid billing as ready even without five dollars of stored credits', async (t) => {
+  const connection = await connectedClient(baseFake({
+    async onboarding() {
+      return {
+        account_state: {
+          authenticated: true,
+          ready_for_included_run: false,
+          ready_for_paid_runs: true,
+        },
+        billing: { credits: 0, has_card_on_file: true, auto_recharge_enabled: true },
+        free_run: { available: false },
+      };
+    },
+  }));
+  t.after(() => connection.close());
+  const onboarding = await connection.client.callTool({
+    name: 'webhound_onboarding',
+    arguments: { client: 'codex' },
+  });
+  assert.equal(onboarding.isError, false);
+  assert.equal(onboarding.structuredContent.account_state.can_start_default_paid_run, true);
+  assert.equal(onboarding.structuredContent.account_state.billing_configured_for_uninterrupted_runs, true);
+  assert.deepEqual(onboarding.structuredContent.choices.map(choice => choice.id), ['setup_first', 'jump_in']);
+  assert.doesNotMatch(onboarding.structuredContent.message, /add credits or connect billing/i);
 });
 
 test('Manus uninstall guidance reflects OAuth URL-only setup', async (t) => {

@@ -142,7 +142,7 @@ function prependUnreferencedZipBytes(buffer, prefix = Buffer.from('PK\x03\x04'))
 }
 
 test('version and complete tool inventory are stable', () => {
-  assert.equal(VERSION, '0.5.2');
+  assert.equal(VERSION, '0.5.3');
   assert.equal(TOOL_NAMES.length, 30);
   assert.equal(new Set(TOOL_NAMES).size, 30);
 });
@@ -289,6 +289,130 @@ test('health distinguishes reachable API from successful authentication', async 
   assert.equal(health.api_reachable, true);
   assert.equal(health.authenticated, false);
   assert.equal(health.mcp_ready, false);
+});
+
+test('account readiness combines stored credits, configured billing, and eligible included runs without conflating them', async (t) => {
+  const originalFetch = globalThis.fetch;
+  t.after(() => { globalThis.fetch = originalFetch; });
+
+  async function readAccount({
+    credits,
+    availableCredits = credits,
+    card = false,
+    autoRecharge = false,
+    freeRun = false,
+    useFreeRun = true,
+    defaultBudget = 5,
+  }) {
+    globalThis.fetch = async (url) => {
+      const pathname = new URL(url).pathname;
+      if (pathname.endsWith('/account/credits')) {
+        return jsonResponse({
+          success: true,
+          data: {
+            credits,
+            available_credits: availableCredits,
+            reserved_credits: Math.max(0, credits - availableCredits),
+            credit_availability_verified: true,
+            has_card_on_file: card,
+            auto_recharge_enabled: autoRecharge,
+            auto_recharge_blocked: false,
+          },
+        });
+      }
+      if (pathname.endsWith('/account/usage')) {
+        return jsonResponse({ success: true, data: { period_days: 30, total_cost: 0, session_count: 0, operation_count: 0 } });
+      }
+      if (pathname.endsWith('/mcp/free-run')) {
+        return jsonResponse({ success: true, data: { free_run: { available: freeRun, included_value_usd: 5 } } });
+      }
+      if (pathname.endsWith('/mcp/defaults')) {
+        return jsonResponse({ success: true, data: { defaults: { default_budget_usd: defaultBudget, default_product: 'report', use_free_run_when_available: useFreeRun } } });
+      }
+      return jsonResponse({ error: 'unexpected endpoint' }, 500);
+    };
+    return new WebhoundApiClient({ apiKey: 'wh_test' }).account();
+  }
+
+  const configuredBilling = await readAccount({ credits: 0, card: true, autoRecharge: true });
+  assert.equal(configuredBilling.can_start_default_paid_run, true);
+  assert.equal(configuredBilling.can_start_default_run, true);
+  assert.equal(configuredBilling.billing_configured_for_uninterrupted_runs, true);
+  assert.equal(configuredBilling.credit_availability_verified, true);
+
+  const storedCredits = await readAccount({ credits: 10 });
+  assert.equal(storedCredits.can_start_default_paid_run, true);
+  assert.equal(storedCredits.can_start_default_run, true);
+  assert.equal(storedCredits.billing_configured_for_uninterrupted_runs, false);
+
+  const includedRun = await readAccount({ credits: 0, freeRun: true, useFreeRun: true });
+  assert.equal(includedRun.can_start_default_paid_run, false);
+  assert.equal(includedRun.can_start_default_run, true);
+  assert.equal(includedRun.billing_configured_for_uninterrupted_runs, false);
+
+  const optedOut = await readAccount({ credits: 0, freeRun: true, useFreeRun: false });
+  assert.equal(optedOut.can_start_default_paid_run, false);
+  assert.equal(optedOut.can_start_default_run, false);
+
+  const largerSavedDefault = await readAccount({ credits: 5, defaultBudget: 20 });
+  assert.equal(largerSavedDefault.can_start_default_paid_run, false);
+  assert.equal(largerSavedDefault.can_start_default_run, false);
+  assert.equal(largerSavedDefault.can_start_standard_onboarding_paid_run, true);
+  assert.equal(largerSavedDefault.can_start_standard_onboarding_run, true);
+
+  const quickCredits = await readAccount({ credits: 2, defaultBudget: 5, useFreeRun: false });
+  assert.equal(quickCredits.minimum_supported_budget_usd, 1);
+  assert.equal(quickCredits.can_start_any_onboarding_paid_run, true);
+  assert.equal(quickCredits.can_start_any_onboarding_run, true);
+  assert.equal(quickCredits.can_start_standard_onboarding_paid_run, false);
+  assert.equal(quickCredits.can_start_standard_onboarding_run, false);
+
+  const belowMinimum = await readAccount({ credits: 0.999, defaultBudget: 5, useFreeRun: false });
+  assert.equal(belowMinimum.can_start_any_onboarding_paid_run, false);
+  assert.equal(belowMinimum.can_start_any_onboarding_run, false);
+
+  const fullyReserved = await readAccount({ credits: 5, availableCredits: 0 });
+  assert.equal(fullyReserved.can_start_default_paid_run, false);
+  assert.equal(fullyReserved.can_start_default_run, false);
+  assert.equal(fullyReserved.can_start_any_onboarding_run, false);
+  assert.equal(fullyReserved.can_start_standard_onboarding_run, false);
+});
+
+test('defaults outages and partial responses fail closed for included-run readiness and starts', async (t) => {
+  const originalFetch = globalThis.fetch;
+  t.after(() => { globalThis.fetch = originalFetch; });
+  globalThis.fetch = async (url) => {
+    const pathname = new URL(url).pathname;
+    if (pathname.endsWith('/account/credits')) {
+      return jsonResponse({ success: true, data: { credits: 0, available_credits: 0, reserved_credits: 0, credit_availability_verified: true } });
+    }
+    if (pathname.endsWith('/account/usage')) return jsonResponse({ success: true, data: {} });
+    if (pathname.endsWith('/mcp/free-run')) return jsonResponse({ success: true, data: { free_run: { available: true, included_value_usd: 5 } } });
+    if (pathname.endsWith('/mcp/defaults')) return jsonResponse({ error: 'defaults unavailable' }, 503);
+    return jsonResponse({ error: 'unexpected endpoint' }, 500);
+  };
+  const account = await new WebhoundApiClient({ apiKey: 'wh_test' }).account();
+  assert.equal(account.defaults, null);
+  assert.equal(account.can_start_default_run, false);
+  assert.equal(account.can_start_any_onboarding_run, false);
+  assert.equal(account.can_start_standard_onboarding_run, false);
+
+  for (const method of ['startReport', 'startDataset']) {
+    const client = new WebhoundApiClient({ apiKey: 'wh_test' });
+    const sent = [];
+    client.getDefaults = async () => { throw new Error('defaults unavailable'); };
+    client.postMutation = async (_endpoint, body) => { sent.push(body); return { session_id: `${method}-1` }; };
+    await client[method]({ prompt: 'Research safely' });
+    assert.equal(sent[0].budget, 5, method);
+    assert.equal(sent[0].use_free_run_when_available, false, method);
+
+    client.getDefaults = async () => ({ default_budget_usd: 5 });
+    await client[method]({ prompt: 'Research safely' });
+    assert.equal(sent[1].use_free_run_when_available, false, `${method} partial defaults`);
+
+    await client[method]({ prompt: 'Research safely', use_free_run_when_available: true });
+    assert.equal(sent[2].use_free_run_when_available, true, `${method} explicit consent`);
+  }
 });
 
 test('watch and wait terminate on a missing session', async (t) => {

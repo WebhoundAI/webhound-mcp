@@ -19,28 +19,29 @@ model or mode, and it is not a direct pass-through to one provider.
 ## Onboarding
 
 1. Confirm that the `webhound` MCP server is connected.
-2. If authentication is required, let Kiro open the Webhound authorization
-   flow. Every user connects with their own Webhound account and API key.
-   Never request, embed, share, or reuse a publisher's or another user's key.
+2. If authentication is required, let Kiro open Webhound sign-in and consent.
+   Every user connects with their own Webhound account. Never request, embed,
+   share, or reuse a publisher's or another user's credential.
 3. Use `webhound_onboarding`, `webhound_account`, or `webhound_help` to check
    setup, free-run eligibility, defaults, and billing state.
 4. Before any spend-bearing call, confirm the research question, output type,
    and dollar budget with the user.
 
 The bundled MCP configuration intentionally contains no credential. Webhound's
-OAuth flow exchanges the connecting user's API key for that user's scoped MCP
-token.
+OAuth flow uses the connecting user's Webhound sign-in and consent to issue a
+scoped MCP token for that account.
 
 ## Choose the work product
 
 - Use a report for a cited argument, comparison, market map, recommendation, or
   decision memo.
 - Use a dataset for rows, fields, and per-field provenance.
-- Suggest $2 for scouting, $5 for normal cited research, or $10 for deeper
-  decision-driving work only when the user asks for budget guidance. Do not
-  treat a suggestion as permission to spend.
-- Roughly, $1 buys about 15 minutes of research. This is a changing rule of
-  thumb, not a guarantee.
+- Recommend $2 for quick scouting, $5 for normal cited research, $10 for deep
+  work, or $20 for exhaustive/highest-stakes work only when the user asks for
+  budget guidance. These are starting points, not caps or permission to spend;
+  the user can choose a larger custom budget for longer, deeper research.
+- Roughly, $1 buys about 15 minutes, so $5 is about 75 minutes and $20 is about
+  300 minutes (five hours). Actual runtime still varies.
 
 ## Start and monitor
 

@@ -1,6 +1,6 @@
 {
   "name": "webhound-mcp",
-  "version": "0.5.2",
+  "version": "0.5.3",
   "mcpName": "ai.webhound/webhound",
   "description": "Run budgeted reports and datasets with Hound, Webhound's DeepSeek V4 Pro + GPT-5.4 research harness, and return inspectable cited evidence.",
   "bin": {

@@ -21602,13 +21602,34 @@ function publicOnboarding(value = {}) {
   const onboarding = { ...value || {} };
   if (onboarding.account_state) {
     const billing = onboarding.billing || {};
-    const credits = Number(billing.credits || onboarding.account_state.credits || 0);
+    const credits = Number(billing.credits ?? onboarding.account_state.credit_balance_usd ?? onboarding.account_state.credits ?? 0);
+    const availableCreditsValue = Number(billing.available_credits ?? onboarding.account_state.available_credit_balance_usd);
+    const creditAvailabilityVerified = (billing.credit_availability_verified === true || onboarding.account_state.credit_availability_verified === true) && Number.isFinite(availableCreditsValue) && availableCreditsValue >= 0;
+    const availableCredits = creditAvailabilityVerified ? availableCreditsValue : 0;
     const uninterrupted = billing.has_card_on_file === true && billing.auto_recharge_enabled === true && billing.auto_recharge_blocked !== true;
+    const defaults = publicDefaults(onboarding.account_state.defaults);
+    const freeRun = publicFreeRun(onboarding.account_state.free_run || onboarding.free_run);
+    const savedDefaultBudget = Number(defaults.default_budget_usd);
+    const savedDefaultBudgetKnown = Number.isFinite(savedDefaultBudget) && savedDefaultBudget > 0;
+    const includedRunReady = freeRun.available === true && defaults.use_free_run_when_available === true && onboarding.account_state.included_run_auto_use_enabled !== false;
+    const anyPaidRunReady = availableCredits >= 1 || uninterrupted;
+    const standardPaidRunReady = availableCredits >= 5 || uninterrupted;
+    const paidRunReady = uninterrupted || savedDefaultBudgetKnown && availableCredits >= savedDefaultBudget;
     onboarding.account_state = {
       ...onboarding.account_state,
-      defaults: publicDefaults(onboarding.account_state.defaults),
-      free_run: publicFreeRun(onboarding.account_state.free_run),
-      can_start_default_paid_run: credits >= 5,
+      defaults,
+      free_run: freeRun,
+      credit_balance_usd: credits,
+      available_credit_balance_usd: availableCredits,
+      credit_availability_verified: creditAvailabilityVerified,
+      included_run_auto_use_enabled: includedRunReady,
+      can_start_default_paid_run: paidRunReady,
+      can_start_default_run: paidRunReady || includedRunReady && savedDefaultBudget === 5,
+      can_start_any_onboarding_paid_run: anyPaidRunReady,
+      can_start_any_onboarding_run: anyPaidRunReady || includedRunReady,
+      can_start_standard_onboarding_paid_run: standardPaidRunReady,
+      can_start_standard_onboarding_run: standardPaidRunReady || includedRunReady,
+      minimum_supported_budget_usd: 1,
       billing_configured_for_uninterrupted_runs: uninterrupted
     };
     delete onboarding.account_state.ready_for_paid_runs;
@@ -22458,21 +22479,45 @@ var WebhoundApiClient = class {
       this.get("/mcp/free-run").catch(() => null),
       this.get("/mcp/defaults").catch(() => null)
     ]);
-    const creditBalance = Number(credits?.credits ?? credits?.balance ?? credits?.current_balance ?? 0);
+    const availableCreditBalance = Number(credits?.available_credits);
+    const creditAvailabilityVerified = credits?.credit_availability_verified === true && Number.isFinite(availableCreditBalance) && availableCreditBalance >= 0;
+    const creditBalance = creditAvailabilityVerified ? availableCreditBalance : 0;
+    const totalCreditBalance = Number(credits?.credits ?? credits?.balance ?? credits?.current_balance ?? 0);
+    const reservedCreditBalance = Number(credits?.reserved_credits ?? 0);
     const uninterrupted = credits?.has_card_on_file === true && credits?.auto_recharge_enabled === true && credits?.auto_recharge_blocked !== true;
+    const normalizedFreeRun = freeRun ? publicFreeRun(freeRun.free_run || freeRun) : null;
+    const normalizedDefaults = defaults ? publicDefaults(defaults.defaults || defaults) : null;
+    const savedDefaultBudget = Number(normalizedDefaults?.default_budget_usd);
+    const savedDefaultBudgetKnown = Number.isFinite(savedDefaultBudget) && savedDefaultBudget > 0;
+    const includedRunReady = normalizedFreeRun?.available === true && normalizedDefaults?.use_free_run_when_available === true;
+    const anyPaidRunReady = creditBalance >= 1 || uninterrupted;
+    const standardPaidRunReady = creditBalance >= 5 || uninterrupted;
+    const paidRunReady = uninterrupted || savedDefaultBudgetKnown && creditBalance >= savedDefaultBudget;
+    const includedRunFundsSavedDefault = includedRunReady && savedDefaultBudget === 5;
     return {
       credits,
       usage,
-      free_run: freeRun ? publicFreeRun(freeRun.free_run || freeRun) : null,
-      defaults: defaults ? publicDefaults(defaults.defaults || defaults) : null,
-      can_start_default_paid_run: creditBalance >= 5,
+      free_run: normalizedFreeRun,
+      defaults: normalizedDefaults,
+      credit_balance_usd: Number.isFinite(totalCreditBalance) ? totalCreditBalance : 0,
+      available_credit_balance_usd: creditBalance,
+      reserved_credit_balance_usd: Number.isFinite(reservedCreditBalance) ? Math.max(0, reservedCreditBalance) : 0,
+      credit_availability_verified: creditAvailabilityVerified,
+      can_start_default_paid_run: paidRunReady,
+      can_start_default_run: paidRunReady || includedRunFundsSavedDefault,
+      can_start_any_onboarding_paid_run: anyPaidRunReady,
+      can_start_any_onboarding_run: anyPaidRunReady || includedRunReady,
+      can_start_standard_onboarding_paid_run: standardPaidRunReady,
+      can_start_standard_onboarding_run: standardPaidRunReady || includedRunReady,
+      minimum_supported_budget_usd: 1,
       billing_configured_for_uninterrupted_runs: uninterrupted
     };
   }
   async startReport(args2) {
     const contextSessionIds = await this.validateContextSessions(args2.context_session_ids);
-    const defaults = await this.getDefaults().catch(() => ({}));
-    const budget = Number(args2.budget ?? defaults.default_budget_usd ?? 5);
+    const defaults = await this.getDefaults().catch(() => null);
+    const budget = Number(args2.budget ?? defaults?.default_budget_usd ?? 5);
+    const useFreeRunWhenAvailable = args2.use_free_run_when_available ?? defaults?.use_free_run_when_available === true;
     const result = await this.postMutation("/research", {
       title: args2.title || titleFromPrompt(args2.prompt),
       query: args2.prompt,
@@ -22483,14 +22528,15 @@ var WebhoundApiClient = class {
       context_session_ids: contextSessionIds.length > 0 ? contextSessionIds : void 0,
       file_ids: args2.file_ids || void 0,
       enable_checkpoints: args2.enable_checkpoints,
-      use_free_run_when_available: args2.use_free_run_when_available ?? defaults.use_free_run_when_available ?? true
+      use_free_run_when_available: useFreeRunWhenAvailable
     }, "Search/list recent sessions and inspect account usage for a matching title before retrying. Retry only after confirming no session was created.");
     return publicStartResult(result);
   }
   async startDataset(args2) {
     const contextSessionIds = await this.validateContextSessions(args2.context_session_ids);
-    const defaults = await this.getDefaults().catch(() => ({}));
-    const budget = Number(args2.budget ?? defaults.default_budget_usd ?? 5);
+    const defaults = await this.getDefaults().catch(() => null);
+    const budget = Number(args2.budget ?? defaults?.default_budget_usd ?? 5);
+    const useFreeRunWhenAvailable = args2.use_free_run_when_available ?? defaults?.use_free_run_when_available === true;
     const normalizedSchema = normalizeDatasetSchema(args2.schema);
     const result = await this.postMutation("/extractions", {
       title: args2.title || titleFromPrompt(args2.prompt),
@@ -22502,7 +22548,7 @@ var WebhoundApiClient = class {
       context_session_ids: contextSessionIds.length > 0 ? contextSessionIds : void 0,
       file_ids: args2.file_ids || void 0,
       enable_checkpoints: args2.enable_checkpoints,
-      use_free_run_when_available: args2.use_free_run_when_available ?? defaults.use_free_run_when_available ?? true
+      use_free_run_when_available: useFreeRunWhenAvailable
     }, "Search/list recent sessions and inspect account usage for a matching dataset title before retrying. Retry only after confirming no extraction was created.");
     const publicResult = publicStartResult(result);
     return {
@@ -22781,7 +22827,7 @@ var WebhoundApiClient = class {
 };
 
 // core/server.mjs
-var VERSION = "0.5.2";
+var VERSION = "0.5.3";
 var BILLING_URL = "https://www.webhound.ai/billing";
 var MCP_RESOURCE_METADATA_URL = process.env.WEBHOUND_MCP_RESOURCE_METADATA_URL || "https://api.webhound.ai/.well-known/oauth-protected-resource/api/v2/mcp";
 var STRUCTURED_CONTENT_VERSION = "webhound-mcp-0.5";
@@ -22841,11 +22887,11 @@ The normal loop is:
 
 While watching a running job, keep user-facing progress concise. Do not show raw status JSON, internal operation counts, provisional document lists, or unfinished working-doc titles. Intermediate workspace state helps the agent monitor the run, but it is not final evidence or a finished finding. Do not read or summarize working notes mid-run unless the user explicitly asks for a partial update.
 
-Defaults exist so agents do not waste user time asking about implementation choices and budget. Use a $5 budget and use_free_run_when_available=true unless the user asks otherwise. Do not ask the user to choose a model or mode. Reports and datasets may use a user's included $5 run when available. As a rule of thumb, $1 buys about 15 minutes of research.
+Defaults exist so agents do not waste user time asking about implementation choices and budget. Use a $5 first-run budget. Honor the saved use_free_run_when_available preference: use an included pass automatically only when that preference is true, or after the user explicitly opts in for one exact $5 report or dataset. Do not ask the user to choose a model or mode. As a rule of thumb, $1 buys about 15 minutes of research. Useful starting points are $2 quick, $5 standard, $10 deep, and $20 exhaustive/highest-stakes (about 300 minutes or 5 hours). These tiers are not caps; users can choose a larger custom budget for longer, deeper research.
 
 If you are helping a user install local stdio MCP, tell them to restart the agent session or open a new one after saving config if Webhound tools do not appear. Many clients load MCP servers only when a session starts.
 
-If the user asks to run Webhound onboarding, call webhound_onboarding with the current client when known and follow its compact next_action one step at a time. Hosted clients must not create or edit workspace rules unless the user explicitly requests that separate action. Starting research must never implicitly trigger workspace-rule setup.
+If the user asks to run Webhound onboarding, call webhound_onboarding once with the current client when known. Send its immediate_next_message exactly once. Treat agent_playbook.conversation_flow as the one canonical sequence: the entry whose say matches immediate_next_message is already consumed, so after the user replies continue with the next unconsumed entry. setup_flow is reference-only and next_action is only the entry instruction; never replay them as additional sequences. Do not repeatedly call webhound_onboarding to advance it. Continue the first run through done=true and return its output with sources and provenance. For local agents, preserve the user's setup-first versus jump-in choice. For hosted clients, start with the research flow and never create or edit workspace rules unless the user explicitly requests that separate action. If the user changes the subject, drop onboarding immediately and answer the new request. Starting research must never implicitly trigger workspace-rule setup.
 
 If the user asks how Webhound works, call webhound_help with the closest topic and explain only the relevant part. If the user wants to remove Webhound from their agent, call webhound_uninstall; it gives removal guidance but does not revoke keys automatically.
 
@@ -22859,7 +22905,7 @@ Start long-running Webhound work, then treat it as the calling agent's research 
 Recommended first run:
 - product: report or dataset
 - budget: $5
-- free run: enabled when available
+- free run: use automatically only when the saved preference is true, or after explicit consent for this exact $5 run
 
 Hound:
 - Hound is the research harness exposed by Webhound, not a selectable foundation model or mode.
@@ -22870,6 +22916,7 @@ Hound:
 
 Budget model:
 - $1 buys about 15 minutes of research.
+- Recommended starting points are $2 quick, $5 standard, $10 deep, and $20 exhaustive/highest-stakes (about 300 minutes or 5 hours). They are not caps; a user can choose a larger custom budget for longer, deeper research.
 - The budget buys research depth, not a fixed answer length.
 - A healthy run may keep working through several wait cycles while it uses the budget.
 - More budget means more room for source discovery, reading, writing, and verification.
@@ -23091,18 +23138,32 @@ var TOOL_OUTPUT_SCHEMAS = Object.freeze({
   }),
   webhound_onboarding: toolOutputSchema("webhound_onboarding", {
     flow_id: external_exports.string().optional(),
-    flow_version: external_exports.literal(1).optional(),
+    flow_version: external_exports.literal(2).optional(),
+    onboarding_version: external_exports.string().optional(),
+    flow_sequence: FLEX_OBJECT.optional(),
     client: external_exports.string().optional(),
     client_mode: external_exports.string().optional(),
     step: external_exports.string().optional(),
     message: external_exports.string().optional(),
     choices: FLEX_ARRAY.optional(),
+    setup_timing_choices: FLEX_ARRAY.optional(),
+    first_artifact_choices: FLEX_ARRAY.optional(),
     next_action: external_exports.string().optional(),
+    topic_change_behavior: external_exports.string().optional(),
     workspace_rules: FLEX_OBJECT.optional(),
+    hosted_safety: FLEX_OBJECT.optional(),
     account_state: FLEX_OBJECT.optional(),
     free_run: FLEX_OBJECT.optional(),
     billing: FLEX_OBJECT.optional(),
-    recommended_defaults: FLEX_OBJECT.optional()
+    recommended_defaults: FLEX_OBJECT.optional(),
+    budget_model: FLEX_OBJECT.optional(),
+    budget_summary: FLEX_OBJECT.optional(),
+    agent_playbook: FLEX_OBJECT.optional(),
+    user_facing_guidance: FLEX_OBJECT.optional(),
+    immediate_next_message: external_exports.string().optional(),
+    setup_flow: external_exports.array(external_exports.string()).optional(),
+    suggested_agent_rules: FLEX_OBJECT.optional(),
+    billing_url: external_exports.string().nullable().optional()
   }),
   webhound_help: toolOutputSchema("webhound_help", {
     topic: external_exports.string().optional(),
@@ -23412,7 +23473,17 @@ var TOOL_OUTPUT_SCHEMAS = Object.freeze({
     defaults: FLEX_OBJECT.nullable().optional(),
     billing: FLEX_OBJECT.optional(),
     research_harness: external_exports.string().optional(),
+    credit_balance_usd: external_exports.number().optional(),
+    available_credit_balance_usd: external_exports.number().optional(),
+    reserved_credit_balance_usd: external_exports.number().optional(),
+    credit_availability_verified: external_exports.boolean().optional(),
     can_start_default_paid_run: external_exports.boolean().optional(),
+    can_start_default_run: external_exports.boolean().optional(),
+    can_start_any_onboarding_paid_run: external_exports.boolean().optional(),
+    can_start_any_onboarding_run: external_exports.boolean().optional(),
+    can_start_standard_onboarding_paid_run: external_exports.boolean().optional(),
+    can_start_standard_onboarding_run: external_exports.boolean().optional(),
+    minimum_supported_budget_usd: external_exports.number().optional(),
     billing_configured_for_uninterrupted_runs: external_exports.boolean().optional()
   }),
   webhound_diagnose: toolOutputSchema("webhound_diagnose", {
@@ -23448,7 +23519,7 @@ function validPublicUrl(value) {
 }
 var TOOL_SUCCESS_CONTRACTS = Object.freeze({
   webhound_health: (data) => typeof data.mcp_ready === "boolean" && typeof data.api_reachable === "boolean" && typeof data.authenticated === "boolean" && isRecord(data.services) && Array.isArray(data.errors) ? null : "health readiness, reachability, authentication, services, or errors are missing",
-  webhound_onboarding: (data) => hasText(data.flow_id) && data.flow_version === 1 && hasText(data.message) && Array.isArray(data.choices) && hasText(data.next_action) && isRecord(data.account_state) ? null : "the onboarding state-machine response is incomplete",
+  webhound_onboarding: (data) => hasText(data.flow_id) && data.flow_version === 2 && hasText(data.onboarding_version) && data.flow_sequence?.canonical === "agent_playbook.conversation_flow" && data.flow_sequence?.setup_flow_role === "reference_only" && data.flow_sequence?.next_action_role === "entry_instruction_only" && hasText(data.message) && Array.isArray(data.choices) && hasText(data.next_action) && isRecord(data.account_state) && isRecord(data.budget_model) && isRecord(data.budget_summary) && Number(data.budget_summary.minutes_per_dollar) === 15 && Number(data.budget_summary.standard_default_budget_usd) === 5 && Number(data.budget_summary.standard_default_research_minutes) === 75 && data.budget_summary.tiers_are_caps === false && Array.isArray(data.budget_summary.recommended_starting_points) && data.budget_summary.recommended_starting_points.some((tier) => Number(tier?.amount_usd) === 20 && Number(tier?.estimated_minutes) === 300) && data.budget_model?.dollars_to_minutes?.["$20"] === "about 300 minutes (5 hours)" && isRecord(data.agent_playbook) && isRecord(data.user_facing_guidance) && hasText(data.immediate_next_message) && Array.isArray(data.setup_flow) ? null : "the rich onboarding response, budget mapping, or guided flow is incomplete",
   webhound_help: (data) => hasText(data.topic) && hasText(data.answer) && data.no_spend === true && Array.isArray(data.related_tools) ? null : "help topic, answer, no-spend marker, or related tools are missing",
   webhound_uninstall: (data) => hasText(data.client) && Array.isArray(data.steps) && data.steps.length > 0 && data.no_spend === true && data.guidance_only === true ? null : "uninstall guidance is incomplete",
   webhound_get_defaults: (data) => hasFiniteNumber(data.default_budget_usd) && hasText(data.default_product) && typeof data.use_free_run_when_available === "boolean" && hasText(data.research_harness) ? null : "saved MCP defaults are incomplete",
@@ -23564,7 +23635,45 @@ var JSON_DATASET_SCHEMA = external_exports.object({
   ]).optional()
 }).passthrough();
 var DATASET_SCHEMA_INPUT = external_exports.union([NATIVE_DATASET_SCHEMA, JSON_DATASET_SCHEMA]);
-var ONBOARDING_CLIENTS = ["hosted", "manus", "codex", "claude_code", "cursor", "claude_desktop", "generic"];
+var ONBOARDING_CLIENTS = [
+  "hosted",
+  "manus",
+  "codex",
+  "claude_code",
+  "cursor",
+  "opencode",
+  "claude_desktop",
+  "vscode",
+  "antigravity",
+  "windsurf",
+  "cline",
+  "local",
+  "generic"
+];
+var HOSTED_ONBOARDING_CLIENTS = /* @__PURE__ */ new Set(["hosted", "manus"]);
+var LOCAL_ONBOARDING_CLIENTS = /* @__PURE__ */ new Set([
+  "codex",
+  "claude_code",
+  "cursor",
+  "opencode",
+  "claude_desktop",
+  "vscode",
+  "antigravity",
+  "windsurf",
+  "cline",
+  "local"
+]);
+var ONBOARDING_MINUTES_PER_DOLLAR = 15;
+var MINIMUM_ONBOARDING_BUDGET_USD = 1;
+var STANDARD_ONBOARDING_BUDGET_USD = 5;
+var STANDARD_ONBOARDING_MINUTES = STANDARD_ONBOARDING_BUDGET_USD * ONBOARDING_MINUTES_PER_DOLLAR;
+var ONBOARDING_BUDGET_STARTING_POINTS = Object.freeze([
+  { amount_usd: 2, estimated_minutes: 30, label: "quick", use: "Quick scouting, narrow questions, or first-pass context." },
+  { amount_usd: 5, estimated_minutes: 75, label: "standard", use: "Normal cited research, market scans, comparisons, and first-pass datasets." },
+  { amount_usd: 10, estimated_minutes: 150, label: "deep", use: "Broad, ambiguous, decision-driving, or high-stakes research." },
+  { amount_usd: 20, estimated_minutes: 300, estimated_hours: 5, label: "exhaustive/highest-stakes", use: "An exhaustive starting point for the highest-stakes investigations." }
+]);
+var ONBOARDING_TOPIC_CHANGE_BEHAVIOR = "If the user asks a different question, immediately drop onboarding and answer the new request. Do not mention onboarding as pending. Resume only if the user explicitly asks to continue it.";
 var DATASET_SCHEMA_EXAMPLES = Object.freeze({
   webhound_native: {
     entity_name: "Company",
@@ -23965,17 +24074,17 @@ var HELP_GUIDANCE = Object.freeze({
     suggested_user_facing_wording: "This looks like something Webhound is good for because it needs multiple sources and a cited synthesis."
   },
   budget: {
-    answer: "Budget controls research depth. As a rule of thumb, $1 buys about 15 minutes of research. The recommended default is $5; a useful local policy is $2 quick, $5 standard, $10 deep. A user can explicitly lower a running report budget to revise its research scope; the revised boundary is reached before normal assembly.",
+    answer: "Budget controls research depth. As a rule of thumb, $1 buys about 15 minutes of research. The recommended default is $5; useful starting points are $2 quick, $5 standard, $10 deep, and $20 exhaustive/highest-stakes (about 300 minutes or 5 hours). These tiers are not caps, and a user can choose a larger custom budget for longer, deeper research. A user can explicitly lower a running report budget to revise its research scope; the revised boundary is reached before normal assembly.",
     agent_behavior_rules: [
       "Default to $5 unless the user gives another budget or local rules say otherwise.",
-      "Use $2 for quick scouting, $5 for normal cited research, and $10 for high-stakes or broad research.",
+      "Use $2 for quick scouting, $5 for normal cited research, $10 for deep research, and $20 as an exhaustive/highest-stakes starting point. Never present $20 as a maximum; users can choose larger custom budgets.",
       "Do not treat using most of the budget as a problem; that is expected value delivery.",
       "Use webhound_set_budget only when the user explicitly asks to reduce the report budget or finish with the research already gathered.",
       "Never lower the budget because the agent thinks the report already looks sufficient."
     ],
     related_tools: ["webhound_get_defaults", "webhound_set_defaults", "webhound_add_budget", "webhound_set_budget", "webhound_account"],
     common_mistakes: ["Telling Webhound to finalize early because spend is low or time has passed.", "Lowering the budget without an explicit user request.", "Forgetting that more budget means more searching, reading, writing, and verification."],
-    suggested_user_facing_wording: "More budget gives Webhound more time to research. A good default is $5; I can use $2 for quick scouting or $10 when depth matters."
+    suggested_user_facing_wording: "More budget gives Webhound more time to research. A good default is $5; useful starting points are $2 quick, $10 deep, and $20 exhaustive/highest-stakes. Those are not caps, so you can choose a larger custom budget for longer research."
   },
   completion: {
     answer: "The authoritative completion signal is webhound_watch.done === true. output_ready without done=true can be intermediate, and working notes are not the final answer.",
@@ -24068,7 +24177,7 @@ var HELP_GUIDANCE = Object.freeze({
   free_run: {
     answer: "New users may have one included $5 run for a private report or dataset. It is not divisible into smaller credits and should be used with the normal $5 default when available.",
     agent_behavior_rules: [
-      "Use use_free_run_when_available=true for the first eligible $5 report or dataset.",
+      "Honor the saved free-run preference. Use use_free_run_when_available=true only when it permits automatic use or after the user explicitly opts in for one exact $5 report or dataset.",
       "Do not try to split the pass across smaller runs.",
       "If the pass is gone, use credits or guide the user to billing."
     ],
@@ -24090,12 +24199,14 @@ var HELP_GUIDANCE = Object.freeze({
     suggested_user_facing_wording: "I will diagnose the session and tell you whether it is actually blocked or just still doing budgeted research."
   },
   onboarding: {
-    answer: "Onboarding is a compact, client-aware first-run flow. It asks one question at a time and moves directly to a report or dataset. Hosted clients never create or edit workspace rules unless the user explicitly requests that separate action.",
+    answer: "Onboarding is a client-aware guided first-run flow. It explains account and included-run state, the budget model, setup-first versus jump-in for local agents, report versus dataset selection, honest waiting through done=true, provenance/export, and billing follow-up. Hosted clients receive the full research flow but never create or edit workspace rules unless the user explicitly requests that separate action.",
     agent_behavior_rules: [
-      "Call webhound_onboarding with the current client when known. Send its message once, present its choices, and follow its next_action one step at a time instead of summarizing account state.",
+      "Call webhound_onboarding once with the current client when known. Send immediate_next_message once. Treat agent_playbook.conversation_flow as the canonical sequence, skip the entry whose say matches the message already sent, and continue with the next unconsumed entry after the user replies. setup_flow is reference-only and next_action is only the entry instruction. Do not repeatedly call onboarding to advance it; continue the first run through done=true and return its output with sources and provenance.",
       "Ask one question at a time.",
       "Do not inject workspace-rule setup into start_report or start_dataset responses.",
       "For hosted clients, do not create or edit workspace rules unless the user explicitly asks.",
+      "Explain that $1 buys about 15 minutes, so the $5 default is about 75 minutes. Present $2 quick, $5 standard, $10 deep, and $20 exhaustive/highest-stakes as recommended starting points rather than caps.",
+      "If the user changes the subject, drop onboarding immediately and answer the new request. Do not keep onboarding pending.",
       "While the first run works, use the sidecar pattern: do useful local/independent work and save concrete source-backed notes with webhound_add_sidecar_notes.",
       "Prefer project-specific rules. If multiple accessible projects are approved, propose per-project rules. If the target project is not accessible, offer a global/user-level rule file or exact snippet to paste.",
       "Do not send workspace files or memories to Webhound for rules."
@@ -24149,56 +24260,428 @@ function buildHelp(topic, question = "") {
     related_topics: HELP_TOPICS.filter((item) => item !== resolvedTopic).slice(0, 6)
   };
 }
-function compactOnboarding(data = {}, {
+function withoutAgentRules(value) {
+  if (!isRecord(value)) return value;
+  const { agent_rules: _agentRules, ...rest } = value;
+  return rest;
+}
+function withOnboardingBudgetGuide(value) {
+  const text = hasText(value) ? value.trim() : "Welcome to Webhound onboarding.";
+  const hasOneDollarMapping = /\$1\b[^\n.]*15 minutes/i.test(text);
+  const hasFiveDollarMapping = /\$5\b[^\n.]*75 minutes/i.test(text);
+  const hasTwentyDollarMapping = /\$20\b[^\n.]*300 minutes|\$20\b[^\n.]*5 hours/i.test(text);
+  if (hasOneDollarMapping && hasFiveDollarMapping && hasTwentyDollarMapping && /not (?:a )?cap|not caps/i.test(text)) return text;
+  return `${text}
+
+Budget guide: $1 buys about 15 minutes of research. Recommended starting points are $2 quick, $5 standard (about 75 minutes), $10 deep, and $20 exhaustive/highest-stakes (about 300 minutes or 5 hours). These tiers are not caps; you can choose a larger custom budget for longer, deeper research.`;
+}
+function normalizeOnboardingTierLanguage(value) {
+  if (typeof value === "string") {
+    if (value.includes("$2") && value.includes("$5") && value.includes("$10") && !value.includes("$20")) {
+      return `${value} Also include $20 as an exhaustive/highest-stakes starting point (about 300 minutes or 5 hours). These tiers are not caps; users can choose a larger custom budget for longer, deeper research.`;
+    }
+    return value;
+  }
+  if (Array.isArray(value)) return value.map(normalizeOnboardingTierLanguage);
+  if (!isRecord(value)) return value;
+  return Object.fromEntries(
+    Object.entries(value).map(([key, nested]) => [key, normalizeOnboardingTierLanguage(nested)])
+  );
+}
+function canonicalOnboardingBudgetPolicy(value = {}) {
+  const policy = isRecord(value) ? normalizeOnboardingTierLanguage(value) : {};
+  const tiers = Array.isArray(policy.tiers) ? [...policy.tiers] : [];
+  for (const startingPoint of ONBOARDING_BUDGET_STARTING_POINTS) {
+    if (!tiers.some((tier) => Number(tier?.amount_usd ?? tier?.amount) === startingPoint.amount_usd)) {
+      tiers.push({ ...startingPoint });
+    }
+  }
+  return {
+    ...policy,
+    tiers,
+    tiers_are_caps: false,
+    custom_budget_guidance: "The recommended tiers are starting points, not caps. Users can choose a larger custom budget for longer, deeper research."
+  };
+}
+function canonicalOnboardingAgentRules(value = {}) {
+  const rules = isRecord(value) ? normalizeOnboardingTierLanguage(value) : {};
+  return {
+    ...rules,
+    budget_guidance: withOnboardingBudgetGuide(rules.budget_guidance || "Budget is a research primitive."),
+    budget_policy: canonicalOnboardingBudgetPolicy(rules.budget_policy)
+  };
+}
+function canonicalOnboardingWorkspaceRules(value = {}) {
+  const rules = isRecord(value) ? normalizeOnboardingTierLanguage(value) : {};
+  return {
+    ...rules,
+    ...isRecord(rules.suggested_rules) ? { suggested_rules: canonicalOnboardingAgentRules(rules.suggested_rules) } : {},
+    ...isRecord(rules.budget_policy) ? { budget_policy: canonicalOnboardingBudgetPolicy(rules.budget_policy) } : {}
+  };
+}
+function canonicalOnboardingBudgetModel(value = {}) {
+  const budgetModel = isRecord(value) ? normalizeOnboardingTierLanguage(value) : {};
+  const dollarsToMinutes = isRecord(budgetModel.dollars_to_minutes) ? budgetModel.dollars_to_minutes : {};
+  const minutesToDollars = isRecord(budgetModel.minutes_to_dollars_examples) ? budgetModel.minutes_to_dollars_examples : {};
+  return {
+    rule_of_thumb: "$1 buys about 15 minutes of research.",
+    dollars_to_minutes: {
+      ...dollarsToMinutes,
+      "$1": "about 15 minutes",
+      "$2": "about 30 minutes",
+      "$3": "about 45 minutes",
+      "$5": "about 75 minutes",
+      "$10": "about 150 minutes",
+      "$20": "about 300 minutes (5 hours)"
+    },
+    minutes_to_dollars_examples: {
+      ...minutesToDollars,
+      "30 minutes": "$2",
+      "45 minutes": "$3",
+      "75 minutes": "$5",
+      "90 minutes": "$6",
+      "300 minutes": "$20"
+    },
+    tiers_are_caps: false,
+    custom_budget_guidance: "These tiers are recommended starting points, not caps. Users can choose a larger custom budget for longer, deeper research.",
+    agent_language: budgetModel.agent_language || "Users can ask for a Webhound run by dollars or minutes. Convert minutes to dollars using about 15 minutes per $1. Present $2, $5, $10, and $20 as starting points, not maximums; larger custom budgets are available for longer, deeper research.",
+    meaning: budgetModel.meaning || "The budget is research depth. More budget gives Webhound more time to search, read, write, and verify before final output.",
+    completion_signal: budgetModel.completion_signal || "A run is done only when webhound_watch.done is true. output_ready or partial working notes before done=true are not final completion signals."
+  };
+}
+function compactOnboardingSupportTools(value = {}) {
+  if (isRecord(value) && (isRecord(value.help) || isRecord(value.uninstall))) {
+    return {
+      ...isRecord(value.help) ? { help: value.help } : {},
+      ...isRecord(value.uninstall) ? { uninstall: value.uninstall } : {}
+    };
+  }
+  return {
+    help: {
+      tool: "webhound_help",
+      when: "Use when the user asks how Webhound, budgets, completion, sources, billing, or setup work."
+    },
+    uninstall: {
+      tool: "webhound_uninstall",
+      when: "Use when the user wants to remove the MCP connection or approved local Webhound rules."
+    }
+  };
+}
+function compactLocalOnboardingWorkspaceRules(value = {}, fallbackSuggestedRules = {}) {
+  const rules = canonicalOnboardingWorkspaceRules(value);
+  const suggestedRules = isRecord(rules.suggested_rules) ? rules.suggested_rules : canonicalOnboardingAgentRules(fallbackSuggestedRules);
+  return {
+    should_offer_to_save: rules.should_offer_to_save !== false,
+    approval_required: true,
+    automatic_write_allowed: false,
+    exact_destination_required: true,
+    complete_content_preview_required: true,
+    read_back_required: true,
+    reject_empty_or_frontmatter_only: true,
+    suggested_rules: suggestedRules,
+    ...Array.isArray(rules.first_run_options) ? { first_run_options: rules.first_run_options } : {},
+    ...Array.isArray(rules.suggested_use_cases) ? { suggested_use_cases: rules.suggested_use_cases } : {},
+    ...Array.isArray(rules.preference_scale) ? { preference_scale: rules.preference_scale } : {},
+    ...isRecord(rules.rule_targeting) ? { rule_targeting: rules.rule_targeting } : {},
+    ...Array.isArray(rules.audit_rubric) ? { audit_rubric: rules.audit_rubric } : {},
+    ...hasText(rules.personalization_guidance) ? { personalization_guidance: rules.personalization_guidance } : {},
+    ...isRecord(rules.suggested_locations_by_client) ? { suggested_locations_by_client: rules.suggested_locations_by_client } : {}
+  };
+}
+function localOnboardingPlaybook(data, message, canStart, { freeRunRequiresOptIn = false } = {}) {
+  const playbook = isRecord(data.agent_playbook) ? normalizeOnboardingTierLanguage(data.agent_playbook) : {};
+  const interactionStyle = isRecord(playbook.interaction_style) ? playbook.interaction_style : {};
+  const principles = [
+    "Guide the user one question at a time instead of summarizing account state.",
+    "Follow only the matching branch in conversation_flow; never run setup_first and jump_in entries together.",
+    "Never inspect or write workspace rules before the user chooses setup and approves the exact target and full content.",
+    "Explain that $1 buys about 15 minutes of research. Recommend $2 quick, $5 standard, $10 deep, and $20 exhaustive/highest-stakes as starting points, not caps; users can choose larger custom budgets.",
+    "Treat Webhound as a research sidecar: do useful independent work between checks and save concrete source-backed notes with webhound_add_sidecar_notes.",
+    "Wait until done=true, then return the final artifact with sources, provenance, spend, and explicit alerts. Never force finalization or stop a healthy run.",
+    ONBOARDING_TOPIC_CHANGE_BEHAVIOR
+  ];
+  const setupChoiceMessage = canStart ? message : "Funding is confirmed. Would you like to set up this workspace first or jump right into the first research run?";
+  const fundedFlow = [
+    { step: 1, name: "Choose setup timing", say: setupChoiceMessage, choices: ["setup_first", "jump_in"], wait_for_user: true },
+    { step: 2, branch: "setup_first", when: "Run only when the user chose setup_first.", name: "Choose and approve inspection target", say: "Ask where Webhound rules should apply: this project, another accessible project, all approved accessible projects, or global agent rules. Explain that workspace content stays local, and ask permission before inspecting only that target.", wait_for_user: true },
+    { step: 3, branch: "setup_first", when: "Run only after the user approved a setup target.", name: "Propose exact local rules", say: "Inspect only the approved target. Show the exact destination and complete proposed Webhound rule content, including useful use cases and an uncapped $2/$5/$10/$20 budget policy. Ask the user to approve, edit, or skip before writing.", wait_for_user: true },
+    { step: 4, branch: "setup_first", when: "Run only after explicit approval of the exact destination and complete content.", name: "Save and verify approved rules", say: "Write only the approved content, read it back, and fail if it is empty, frontmatter-only, or different. Explain that the rules apply after a restart or new chat, but continue this onboarding to the first run now.", wait_for_user: false },
+    { step: 5, branch: "all", name: "Collect the first research request", say: "Ask whether the user wants a cited report or sourced dataset, the topic, important scope, and budget. Present $2/$5/$10/$20 as recommended starting points, not caps. Offer $5 (about 75 minutes) as the default only when account_state says a standard $5 onboarding run is ready; otherwise ask for an explicit budget within verified available funding. If funding came from use_included_run consent, the pass funds exactly one $5 run.", wait_for_user: true },
+    { step: 6, branch: "all", name: "Verify selected budget funding", say: `Always call webhound_account before starting. Continue only when the complete selected budget is covered by verified paid funding (billing_configured_for_uninterrupted_runs=true, or credit_availability_verified=true with available_credit_balance_usd at least the selected budget), or when an exact $5 report/dataset is covered by an available included pass whose saved preference permits automatic use or whose use the user explicitly approved for this run. An included pass never funds any other amount. If the selected budget is not fully covered, send ${BILLING_URL}, wait for the user to add funding, and recheck.`, tool: "webhound_account", wait_for_user: false },
+    { step: 7, branch: "all", name: "Start the first research run", say: "Start the selected report or dataset from the user-provided topic and scope using exactly the budget established in the preceding conversation and funding check. Never substitute a saved default, assume $5 when only a smaller amount is funded, or launch an amount that the funding check did not cover. Respect the saved free-run preference unless the user explicitly opted in for this run. An included-run opt-in may set use_free_run_when_available=true only for an exact $5 run.", tool: "webhound_start_report or webhound_start_dataset", wait_for_user: false },
+    { step: 8, branch: "jump_in", when: "Run only after starting research when the user chose jump_in.", name: "Offer optional local setup", say: "While Webhound runs, ask whether the user wants the same local setup pass for future chats. If they decline, skip every remaining jump_in_setup entry and continue to Watch.", wait_for_user: true },
+    { step: 9, branch: "jump_in_setup", when: "Run only if the jump_in user accepted optional setup.", name: "Choose and approve optional inspection target", say: "Ask for the exact project or global rule target, explain that workspace content stays local, and obtain permission before inspecting only that target.", wait_for_user: true },
+    { step: 10, branch: "jump_in_setup", when: "Run only after permission to inspect the optional setup target.", name: "Propose optional rules", say: "Inspect only the approved target, then show the exact destination and full proposed content. Ask for explicit approval, edits, or a skip before writing.", wait_for_user: true },
+    { step: 11, branch: "jump_in_setup", when: "Run only after explicit approval of optional setup content.", name: "Save and verify optional rules", say: "Write only approved content, read it back, reject empty or mismatched content, and explain that it applies after restart or a new chat.", wait_for_user: false },
+    { step: 12, branch: "all", name: "Watch to honest completion", say: "Wait until done=true. Do not force finalization or stop a healthy run; use source-backed sidecar notes when useful.", tool: "webhound_wait", wait_for_user: false },
+    { step: 13, branch: "all", name: "Return result and evidence", say: "Return the final output, sources, provenance, spend, and explicit alerts.", tool: "webhound_get_evidence_pack", wait_for_user: false }
+  ];
+  const fundingPrefix = canStart ? [] : [
+    { step: 1, name: freeRunRequiresOptIn ? "Choose first-run funding" : "Unblock billing", say: message, choices: freeRunRequiresOptIn ? ["use_included_run", "billing_ready"] : ["billing_ready"], wait_for_user: true },
+    {
+      step: 2,
+      name: "Confirm funding",
+      say: freeRunRequiresOptIn ? "If the user chose use_included_run, treat that as explicit consent for exactly one $5 report or dataset and continue with use_free_run_when_available=true; any other budget requires paid-funding verification. If they chose paid billing, call webhound_account and continue only when can_start_any_onboarding_run=true; otherwise explain the remaining action and wait." : "After the user says billing is ready, call webhound_account. Continue only when can_start_any_onboarding_run=true; otherwise explain the exact remaining action and wait.",
+      tool: freeRunRequiresOptIn ? "webhound_account (billing_ready branch only)" : "webhound_account",
+      wait_for_user: false
+    }
+  ];
+  const conversationFlow = canStart ? fundedFlow : [...fundingPrefix, ...fundedFlow.map((entry, index) => ({ ...entry, step: index + 3 }))];
+  return {
+    objective: playbook.objective || "Guide setup-first or jump-in without replaying branches, then complete a useful first Webhound run.",
+    interaction_style: {
+      mode: interactionStyle.mode || "guided_setup",
+      pacing: "one_step_at_a_time",
+      ...hasText(interactionStyle.tone) ? { tone: interactionStyle.tone } : {},
+      do_not: [
+        "Do not dump the onboarding payload or repeat a question that was already answered.",
+        "Do not create or edit rules without the exact target, complete preview, and explicit approval."
+      ]
+    },
+    principles,
+    conversation_flow: conversationFlow,
+    workspace_rules: compactLocalOnboardingWorkspaceRules(playbook.workspace_rules, data.suggested_agent_rules),
+    support_tools: compactOnboardingSupportTools(playbook.support_tools),
+    topic_change_behavior: ONBOARDING_TOPIC_CHANGE_BEHAVIOR
+  };
+}
+function hostedOnboardingPlaybook(data, message, canStart, useFreeRunForFirstRun, {
+  freeRunRequiresOptIn = false,
+  workspaceRulesRequested = false
+} = {}) {
+  const source = isRecord(data.agent_playbook) ? normalizeOnboardingTierLanguage(data.agent_playbook) : {};
+  const interactionStyle = isRecord(source.interaction_style) ? source.interaction_style : {};
+  const safeDoNot = Array.isArray(interactionStyle.do_not) ? interactionStyle.do_not.filter((value) => !/workspace|rule file|filesystem/i.test(String(value))) : [];
+  safeDoNot.push(workspaceRulesRequested ? "Do not write workspace or filesystem rules automatically. Follow the separate top-level workspace_rules approval contract, and provide an exact snippet when this hosted client cannot write the approved destination." : "Do not create, edit, or inspect workspace or filesystem rules during hosted onboarding.");
+  const fundedFlow = [
+    { step: 1, name: "Collect the first research request", say: canStart ? message : "Funding is confirmed. Ask whether the first artifact should be a cited report or sourced dataset, plus the topic and important scope.", wait_for_user: true },
+    { step: 2, name: "Verify selected budget funding", say: `Always call webhound_account before starting. Continue only when the complete selected budget is covered by verified paid funding (billing_configured_for_uninterrupted_runs=true, or credit_availability_verified=true with available_credit_balance_usd at least the selected budget), or when an exact $5 report/dataset is covered by an available included pass whose saved preference permits automatic use or whose use the user explicitly approved for this run. An included pass never funds any other amount. If the selected budget is not fully covered, send ${BILLING_URL}, wait for the user to add funding, and recheck.`, tool: "webhound_account", wait_for_user: false },
+    { step: 3, name: "Start research", say: "Use the artifact, topic, scope, and budget established in the user reply and funding check to start the selected run without asking again. Never substitute a saved default, assume $5 when only a smaller amount is funded, or launch an amount the funding check did not cover. If an included pass is being used, set use_free_run_when_available=true only for an exact $5 report or dataset.", tool: "webhound_start_report or webhound_start_dataset", wait_for_user: false },
+    { step: 4, name: "Watch", say: "Wait for done=true without forcing early synthesis or stopping a healthy run.", tool: "webhound_wait", wait_for_user: false },
+    { step: 5, name: "Return result", say: "Return the final artifact with sources, provenance, spend, and explicit alerts.", tool: "webhound_get_evidence_pack", wait_for_user: false }
+  ];
+  const fundingPrefix = canStart ? [] : [
+    { step: 1, name: freeRunRequiresOptIn ? "Choose first-run funding" : "Unblock billing", say: message, choices: freeRunRequiresOptIn ? ["use_included_run", "billing_ready"] : ["billing_ready"], wait_for_user: true },
+    {
+      step: 2,
+      name: "Confirm funding",
+      say: freeRunRequiresOptIn ? "If the user chose use_included_run, treat that as explicit consent for exactly one $5 report or dataset and continue with use_free_run_when_available=true; any other budget requires paid-funding verification. If they chose paid billing, call webhound_account and continue only when can_start_any_onboarding_run=true; otherwise explain the remaining action and wait." : "After the user says billing is ready, call webhound_account. Continue only when can_start_any_onboarding_run=true; otherwise explain the exact remaining action and wait.",
+      tool: freeRunRequiresOptIn ? "webhound_account (billing_ready branch only)" : "webhound_account",
+      wait_for_user: false
+    }
+  ];
+  const conversationFlow = canStart ? fundedFlow : [...fundingPrefix, ...fundedFlow.map((entry, index) => ({ ...entry, step: index + 3 }))];
+  const {
+    workspace_rules: _workspaceRules,
+    support_tools: sourceSupportTools
+  } = source;
+  return {
+    objective: source.objective || "Guide the user into a useful first Webhound research run and return its inspectable result.",
+    interaction_style: {
+      mode: "guided_research_onboarding",
+      pacing: interactionStyle.pacing || "one_step_at_a_time",
+      ...hasText(interactionStyle.tone) ? { tone: interactionStyle.tone } : {},
+      do_not: safeDoNot
+    },
+    principles: [
+      "Guide the user one question at a time instead of summarizing account state.",
+      "Explain that $1 buys about 15 minutes of research. Recommended starting points are $2 quick, $5 standard, $10 deep, and $20 exhaustive/highest-stakes (about 300 minutes or 5 hours). These tiers are not caps; users can choose larger custom budgets.",
+      "Treat Webhound as a research sidecar: do useful independent work between checks and save concrete source-backed notes with webhound_add_sidecar_notes.",
+      "Start the chosen report or dataset, wait until done=true without forcing finalization or stopping a healthy run, and return the output with sources, provenance, spend, and explicit alerts.",
+      workspaceRulesRequested ? "The user explicitly requested separate workspace-rule guidance. Follow the top-level approval contract; never write automatically, and provide a snippet when the hosted client cannot write." : "Do not create or edit workspace rules during hosted onboarding unless the user separately and explicitly requests guidance.",
+      ONBOARDING_TOPIC_CHANGE_BEHAVIOR
+    ],
+    conversation_flow: conversationFlow,
+    support_tools: compactOnboardingSupportTools(sourceSupportTools),
+    topic_change_behavior: ONBOARDING_TOPIC_CHANGE_BEHAVIOR
+  };
+}
+function approvalGatedWorkspaceRules(data, capabilities, hosted) {
+  const source = isRecord(data.agent_playbook?.workspace_rules) ? canonicalOnboardingWorkspaceRules(data.agent_playbook.workspace_rules) : {};
+  const approvalContract = {
+    requested: true,
+    supported: capabilities.workspace_rules_supported === true,
+    approval_required: true,
+    automatic_write_allowed: false,
+    exact_destination_required: true,
+    complete_content_preview_required: true,
+    read_back_required: true,
+    reject_empty_or_frontmatter_only: true,
+    instruction: hosted ? "The user explicitly requested workspace-rule guidance as a separate action. Ask for the exact destination, show the complete proposed content, and obtain explicit approval before any write. If writing is unsupported, provide the exact snippet instead." : "Ask for the exact destination, show the complete proposed content, and obtain explicit approval before any write.",
+    validation: "After an approved write, read the destination back and fail the step if the file is empty, frontmatter-only, or differs from the approved content."
+  };
+  if (!hosted) {
+    return {
+      ...approvalContract,
+      details_path: "agent_playbook.workspace_rules"
+    };
+  }
+  return {
+    ...approvalContract,
+    ...isRecord(source.suggested_rules) ? { suggested_rules: source.suggested_rules } : {},
+    ...Array.isArray(source.audit_rubric) ? { audit_rubric: source.audit_rubric } : {},
+    ...isRecord(source.rule_targeting) ? { rule_targeting: source.rule_targeting } : {}
+  };
+}
+function clientAwareOnboarding(data = {}, {
   client = "generic",
   capabilities = {},
   workspace_rules_requested = false
 } = {}) {
   const resolvedClient = ONBOARDING_CLIENTS.includes(client) ? client : "generic";
-  const hosted = resolvedClient === "hosted" || resolvedClient === "manus";
-  const account = data.account_state || {};
-  const billing = data.billing || account.billing || {};
-  const freeRun = data.free_run || account.free_run || {};
-  const credits = Number(
-    billing.credits ?? billing.credit_balance_usd ?? account.credits ?? account.credit_balance_usd ?? 0
-  );
-  const canStart = account.can_start_default_paid_run === true || account.ready_for_included_run === true || freeRun.available === true || credits >= 5;
-  const uninterrupted = account.billing_configured_for_uninterrupted_runs === true;
-  const message = canStart ? "Webhound is connected. If you want to try it now, choose a cited report or a sourced dataset. You can also ask another Webhound question instead; onboarding is not a pending task." : `This account has $${credits.toFixed(2)} in credits and no available included run. Add credits or connect billing, then tell me when it is ready.`;
-  const choices = canStart ? [
+  const local = LOCAL_ONBOARDING_CLIENTS.has(resolvedClient);
+  const hosted = !local;
+  const rawAccount = isRecord(data.account_state) ? data.account_state : {};
+  const billing = isRecord(data.billing) ? data.billing : isRecord(rawAccount.billing) ? rawAccount.billing : {};
+  const freeRun = isRecord(data.free_run) ? data.free_run : isRecord(rawAccount.free_run) ? rawAccount.free_run : {};
+  const sourceDefaults = isRecord(data.recommended_defaults) ? normalizeOnboardingTierLanguage(data.recommended_defaults) : isRecord(rawAccount.defaults) ? normalizeOnboardingTierLanguage(rawAccount.defaults) : {};
+  const recommendedDefaults = {
+    ...withoutAgentRules(sourceDefaults),
+    default_budget_usd: finiteNumber(sourceDefaults.default_budget_usd) ?? STANDARD_ONBOARDING_BUDGET_USD,
+    default_product: sourceDefaults.default_product || "report",
+    use_free_run_when_available: sourceDefaults.use_free_run_when_available === true
+  };
+  const credits = finiteNumber(
+    billing.credits,
+    billing.credit_balance_usd,
+    rawAccount.credits,
+    rawAccount.credit_balance_usd
+  ) ?? 0;
+  const availableCreditsValue = finiteNumber(billing.available_credits, rawAccount.available_credit_balance_usd);
+  const creditAvailabilityVerified = (billing.credit_availability_verified === true || rawAccount.credit_availability_verified === true) && availableCreditsValue !== null;
+  const availableCredits = creditAvailabilityVerified ? availableCreditsValue : 0;
+  const uninterrupted = rawAccount.billing_configured_for_uninterrupted_runs === true || billing.has_card_on_file === true && billing.auto_recharge_enabled === true && billing.auto_recharge_blocked !== true;
+  const includedRunAutoUseEnabled = freeRun.available === true && recommendedDefaults.use_free_run_when_available === true && rawAccount.included_run_auto_use_enabled !== false;
+  const savedDefaultBudget = recommendedDefaults.default_budget_usd;
+  const standardPaidRunReady = rawAccount.can_start_standard_onboarding_paid_run === true || availableCredits >= STANDARD_ONBOARDING_BUDGET_USD || uninterrupted;
+  const anyPaidRunReady = rawAccount.can_start_any_onboarding_paid_run === true || availableCredits >= MINIMUM_ONBOARDING_BUDGET_USD || uninterrupted;
+  const savedDefaultPaidRunReady = rawAccount.can_start_default_paid_run === true || availableCredits >= savedDefaultBudget || uninterrupted;
+  const canStart = rawAccount.can_start_any_onboarding_run === true || includedRunAutoUseEnabled || anyPaidRunReady;
+  const canStartSavedDefault = rawAccount.can_start_default_run === true || savedDefaultPaidRunReady || includedRunAutoUseEnabled && savedDefaultBudget === STANDARD_ONBOARDING_BUDGET_USD;
+  const freeRunRequiresOptIn = freeRun.available === true && !includedRunAutoUseEnabled;
+  const needsFundingChoice = freeRunRequiresOptIn && !anyPaidRunReady;
+  const sourceAccountDefaults = isRecord(rawAccount.defaults) ? normalizeOnboardingTierLanguage(rawAccount.defaults) : rawAccount.defaults;
+  const rawAccountDefaults = withoutAgentRules(sourceAccountDefaults);
+  const accountState = {
+    ...isRecord(rawAccountDefaults) ? { defaults: rawAccountDefaults } : {},
+    authenticated: rawAccount.authenticated !== false,
+    credit_balance_usd: credits,
+    available_credit_balance_usd: availableCredits,
+    credit_availability_verified: creditAvailabilityVerified,
+    included_run_available: freeRun.available === true,
+    included_run_auto_use_enabled: includedRunAutoUseEnabled,
+    can_start_default_paid_run: savedDefaultPaidRunReady,
+    can_start_default_run: canStartSavedDefault,
+    can_start_any_onboarding_paid_run: anyPaidRunReady,
+    can_start_any_onboarding_run: canStart,
+    can_start_standard_onboarding_paid_run: standardPaidRunReady,
+    can_start_standard_onboarding_run: rawAccount.can_start_standard_onboarding_run === true || includedRunAutoUseEnabled || standardPaidRunReady,
+    minimum_supported_budget_usd: MINIMUM_ONBOARDING_BUDGET_USD,
+    billing_configured_for_uninterrupted_runs: uninterrupted
+  };
+  const budgetModel = canonicalOnboardingBudgetModel(data.budget_model);
+  const budgetSummary = {
+    minutes_per_dollar: ONBOARDING_MINUTES_PER_DOLLAR,
+    standard_default_budget_usd: STANDARD_ONBOARDING_BUDGET_USD,
+    standard_default_research_minutes: STANDARD_ONBOARDING_MINUTES,
+    rule_of_thumb: "$1 buys about 15 minutes of research.",
+    standard_default: "$5 buys about 75 minutes of research.",
+    recommended_starting_points: ONBOARDING_BUDGET_STARTING_POINTS.map((tier) => ({ ...tier })),
+    tiers_are_caps: false,
+    custom_budget_guidance: "The $2, $5, $10, and $20 tiers are recommended starting points, not caps. Choose a larger custom budget or say how long you want Webhound to research; convert duration at about $1 per 15 minutes.",
+    selected_default_budget_usd: recommendedDefaults.default_budget_usd,
+    selected_default_research_minutes: Math.round(recommendedDefaults.default_budget_usd * ONBOARDING_MINUTES_PER_DOLLAR)
+  };
+  const fundingMessage = includedRunAutoUseEnabled ? "You have an included $5 Webhound run available." : availableCredits >= STANDARD_ONBOARDING_BUDGET_USD ? `${freeRunRequiresOptIn ? "An included $5 run is available, but automatic use is disabled. " : ""}You have $${availableCredits.toFixed(2)} in available credits, enough for a paid standard $5 first run${freeRunRequiresOptIn ? " without consuming the pass" : ""}.` : availableCredits >= MINIMUM_ONBOARDING_BUDGET_USD ? `${freeRunRequiresOptIn ? "An included $5 run is available, but automatic use is disabled. " : ""}You have $${availableCredits.toFixed(2)} in verified available credits. You can choose a paid first-run budget from $1 up to $${availableCredits.toFixed(2)}${freeRunRequiresOptIn ? " without consuming the included pass" : ""}, or add billing for a larger run.` : standardPaidRunReady ? `${freeRunRequiresOptIn ? "An included $5 run is available, but automatic use is disabled. " : ""}Billing is configured, so a paid standard $5 first run is ready${freeRunRequiresOptIn ? " without consuming the pass" : ""}.` : needsFundingChoice ? "You have an included $5 run, but automatic use is disabled. I will not consume it unless you explicitly choose it for this run; otherwise use Webhound Billing." : `This account has $${credits.toFixed(2)} in credits and no available included run. Add credits or connect billing before starting research.`;
+  const hostedBudgetPrompt = standardPaidRunReady || includedRunAutoUseEnabled ? "The recommended first-run default is $5 (about 75 minutes); tell me if you want another budget." : `Choose the first-run budget explicitly. Your verified paid limit right now is $${availableCredits.toFixed(2)}; do not assume or launch the $5 standard budget unless you explicitly approve an available included pass or add funding.`;
+  const hostedMessage = canStart ? `Welcome to Webhound onboarding. ${fundingMessage} ${hostedBudgetPrompt} What should it produce: a cited report or a sourced dataset? Tell me what you want researched and any scope that matters, plus your budget.` : needsFundingChoice ? `Welcome to Webhound onboarding. ${fundingMessage} Choose whether to use the included run this time or set up paid billing.` : `Welcome to Webhound onboarding. ${fundingMessage} Open Webhound Billing, then tell me when billing is ready.`;
+  const localFallbackMessage = canStart ? `Welcome to Webhound onboarding. ${fundingMessage} Before the first run, would you like to set up this workspace first or jump right in? Setup first proposes local rules for your approval, then starts research. Jump in starts the report or dataset first.` : needsFundingChoice ? `Welcome to Webhound onboarding. ${fundingMessage} Choose whether to use the included run this time or set up paid billing.` : `Welcome to Webhound onboarding. ${fundingMessage} Open Webhound Billing, then tell me when billing is ready.`;
+  const message = withOnboardingBudgetGuide(hosted ? hostedMessage : localFallbackMessage);
+  const firstArtifactChoices = [
     { id: "report", label: "Cited report", next_tool: "webhound_start_report" },
     { id: "dataset", label: "Sourced dataset", next_tool: "webhound_start_dataset" }
+  ];
+  const setupTimingChoices = [
+    { id: "setup_first", label: "Set up this workspace first", next_action: "Complete the approval-gated local setup pass, then return to the first run." },
+    { id: "jump_in", label: "Jump right in", next_action: "Choose a report or dataset and start the first run before offering the optional setup pass." }
+  ];
+  const choices = canStart ? hosted ? firstArtifactChoices : setupTimingChoices : needsFundingChoice ? [
+    { id: "use_included_run", label: "Use my included $5 run", next_action: "Treat this choice as explicit approval for one exact $5 report or dataset and start with use_free_run_when_available=true. Any other budget requires paid-funding verification." },
+    { id: "billing_ready", label: "Use paid billing", next_tool: "webhound_account" }
   ] : [{ id: "billing_ready", label: "Billing is ready", next_tool: "webhound_account" }];
+  const localSetupFlow = [
+    "Reference agent_playbook.conversation_flow as the only executable sequence; follow only the setup_first or jump_in branch the user chooses.",
+    "Local rule setup is optional and approval-gated: exact target, complete content preview, explicit approval, write, and readback. Never write empty or frontmatter-only rules.",
+    "Use $2, $5, $10, and $20 as recommended starting points, not caps. $1 buys about 15 minutes, $5 about 75 minutes, and $20 about 300 minutes or 5 hours; larger custom budgets are available.",
+    "Verify the complete selected budget with webhound_account, start the requested artifact only when fully funded, wait until done=true without stopping a healthy run, then return sources, provenance, spend, and explicit alerts."
+  ];
+  const hostedSetupFlow = canStart ? [
+    "Ask whether the first artifact should be a cited report or sourced dataset, then collect the topic and important scope.",
+    "Verify the complete selected budget with webhound_account, then start the chosen run only when fully funded. Explain that $1 buys about 15 minutes of research; use $2 quick, $5 standard, $10 deep, and $20 exhaustive/highest-stakes as starting points, not caps. A $20 run is about 300 minutes or 5 hours, and larger custom budgets are available.",
+    "Watch until done=true without forcing early synthesis or stopping a healthy run.",
+    "Return the final result with sources, provenance, spend, and explicit alerts."
+  ] : needsFundingChoice ? [
+    "Offer use_included_run or billing_ready. Never consume the included pass without the explicit use_included_run choice.",
+    `On use_included_run, continue with use_free_run_when_available=true for this run only. On billing_ready, use ${BILLING_URL}, then recheck webhound_account and continue only when can_start_any_onboarding_run=true.`,
+    "Collect the artifact, topic, scope, and budget; start the run, wait through done=true, and return sources and provenance."
+  ] : [
+    `Send ${BILLING_URL} once and wait until the user says billing is ready.`,
+    "Recheck webhound_account, then resume the hosted research onboarding flow."
+  ];
+  const agentPlaybook = hosted ? hostedOnboardingPlaybook(data, message, canStart, includedRunAutoUseEnabled, {
+    freeRunRequiresOptIn: needsFundingChoice,
+    workspaceRulesRequested: workspace_rules_requested === true
+  }) : localOnboardingPlaybook(data, message, canStart, { freeRunRequiresOptIn: needsFundingChoice });
+  const sourceGuidance = isRecord(data.user_facing_guidance) ? normalizeOnboardingTierLanguage(data.user_facing_guidance) : {};
+  const userFacingGuidance = {
+    ...hasText(sourceGuidance.model_language) ? { model_language: sourceGuidance.model_language } : {},
+    ...hasText(sourceGuidance.session_concept) ? { session_concept: sourceGuidance.session_concept } : {},
+    budget: "$1 buys about 15 minutes of research. Recommended starting points are $2 quick, $5 standard (about 75 minutes), $10 deep, and $20 exhaustive/highest-stakes (about 300 minutes or 5 hours). These tiers are not caps; choose a larger custom budget or simply say how long you want Webhound to research.",
+    topic_change_behavior: ONBOARDING_TOPIC_CHANGE_BEHAVIOR,
+    ...hosted ? {
+      first_run: canStart ? "Ask for a cited report or sourced dataset and the research topic, then start the selected run." : needsFundingChoice ? "Ask whether to use the included $5 run this time or use paid billing. Never consume the pass without the explicit use_included_run choice." : `Send the user to ${BILLING_URL} before starting a spend-bearing tool.`
+    } : {}
+  };
   const result = {
-    flow_id: "webhound-first-run",
-    flow_version: 1,
+    flow_id: data.flow_id || "webhound-first-run",
+    flow_version: 2,
+    onboarding_version: "agent-led-rich-2026-07-25",
+    flow_sequence: {
+      canonical: "agent_playbook.conversation_flow",
+      immediate_next_message_delivery: "Send exactly once before waiting for the user.",
+      consumed_entry_rule: "Any leading conversation_flow entry whose say matches immediate_next_message is already consumed and must not be replayed.",
+      resume_rule: "After the user replies, continue with the next unconsumed conversation_flow entry.",
+      setup_flow_role: "reference_only",
+      next_action_role: "entry_instruction_only"
+    },
     client: resolvedClient,
-    client_mode: hosted ? "hosted_oauth" : "local_or_generic",
-    step: canStart ? "choose_first_artifact" : "unblock_billing",
+    client_mode: local ? "local_agent" : HOSTED_ONBOARDING_CLIENTS.has(resolvedClient) ? "hosted_oauth" : "safe_default",
+    step: canStart ? hosted ? "choose_first_artifact" : "choose_setup_timing" : needsFundingChoice ? "choose_funding" : "unblock_billing",
     message,
     choices,
-    next_action: canStart ? "Offer the two choices once. If the user asks a different question, immediately drop this onboarding step and answer that question without mentioning pending onboarding. Resume only if the user explicitly asks to continue setup." : "Send the billing link once. If the user asks a different question, answer it without repeating onboarding. Recheck webhound_account only after the user says billing is ready.",
-    account_state: {
-      authenticated: account.authenticated !== false,
-      credit_balance_usd: credits,
-      included_run_available: freeRun.available === true,
-      can_start_default_paid_run: canStart,
-      billing_configured_for_uninterrupted_runs: uninterrupted
-    },
-    recommended_defaults: {
-      default_budget_usd: Number(data.recommended_defaults?.default_budget_usd || 5),
-      default_product: data.recommended_defaults?.default_product || "report",
-      use_free_run_when_available: data.recommended_defaults?.use_free_run_when_available !== false
-    },
+    next_action: canStart ? hosted ? `Send immediate_next_message once, mark the matching conversation_flow entry consumed, wait for the user's artifact and topic choice, then continue with the next unconsumed conversation_flow entry. setup_flow is reference-only. ${ONBOARDING_TOPIC_CHANGE_BEHAVIOR}` : `Send immediate_next_message once, mark the matching conversation_flow entry consumed, wait for setup_first or jump_in, then continue with the next unconsumed conversation_flow entry. setup_flow is reference-only. ${ONBOARDING_TOPIC_CHANGE_BEHAVIOR}` : needsFundingChoice ? `Send immediate_next_message once and wait for use_included_run or billing_ready. If use_included_run is chosen, treat it as explicit consent for one exact $5 report or dataset and continue with use_free_run_when_available=true; any other budget requires paid-funding verification. If billing_ready is chosen, verify with webhound_account. Continue with the next unconsumed conversation_flow entry; do not recall onboarding merely to advance the flow. setup_flow is reference-only. ${ONBOARDING_TOPIC_CHANGE_BEHAVIOR}` : `Send the billing link once, mark the matching conversation_flow entry consumed, and wait for the user to say billing is ready. Then continue with the next unconsumed conversation_flow entry, starting with webhound_account; do not recall onboarding merely to advance the flow. setup_flow is reference-only. ${ONBOARDING_TOPIC_CHANGE_BEHAVIOR}`,
+    topic_change_behavior: ONBOARDING_TOPIC_CHANGE_BEHAVIOR,
+    account_state: accountState,
+    free_run: freeRun,
+    billing,
+    recommended_defaults: recommendedDefaults,
+    budget_model: budgetModel,
+    budget_summary: budgetSummary,
+    agent_playbook: agentPlaybook,
+    user_facing_guidance: userFacingGuidance,
+    immediate_next_message: message,
+    setup_flow: hosted ? hostedSetupFlow : localSetupFlow,
+    ...hosted ? {
+      hosted_safety: {
+        workspace_or_filesystem_setup_skipped: workspace_rules_requested !== true,
+        automatic_workspace_or_filesystem_writes_allowed: false,
+        workspace_rule_guidance_requires_explicit_request: true
+      }
+    } : {},
     billing_url: canStart ? null : BILLING_URL
   };
   if (workspace_rules_requested === true) {
-    result.workspace_rules = {
-      supported: capabilities.workspace_rules_supported === true,
-      requested: true,
-      instruction: hosted ? "The user explicitly requested workspace-rule guidance. Ask for the exact destination before proposing or writing anything." : "The user explicitly requested workspace-rule guidance. Ask for the exact destination before proposing or writing anything.",
-      validation_if_explicitly_requested: "Show the complete proposed content and exact destination before writing; after approval, read it back and reject an empty or frontmatter-only file."
-    };
+    result.workspace_rules = approvalGatedWorkspaceRules(data, capabilities, hosted);
   }
   return result;
 }
@@ -24222,6 +24705,7 @@ function creditBalanceFrom(data = {}) {
 }
 function accountTextSummary(data = {}) {
   const balance = creditBalanceFrom(data);
+  const availableBalance = data.credit_availability_verified === true ? finiteNumber(data.credits?.available_credits) : null;
   const usage = data.usage || {};
   const periodDays = finiteNumber(usage.period_days);
   const totalCost = finiteNumber(usage.total_cost);
@@ -24232,7 +24716,7 @@ function accountTextSummary(data = {}) {
   const defaultProduct = String(defaults.default_product || "").trim();
   const lines = [
     "Webhound account:",
-    `Credit balance: ${balance === null ? "unavailable" : `$${balance.toFixed(2)}`}.`,
+    `Credit balance: ${balance === null ? "unavailable" : `$${balance.toFixed(2)}`}.${availableBalance === null ? "" : ` Currently available after active reservations: $${availableBalance.toFixed(2)}.`}`,
     `Included $5 run: ${data.free_run?.available === true ? "available" : data.free_run ? "not available" : "unavailable"}.`
   ];
   if (totalCost !== null || sessionCount !== null || operationCount !== null) {
@@ -24248,11 +24732,21 @@ function accountTextSummary(data = {}) {
   }
   if (usage.last_activity_at) lines.push(`Last activity: ${usage.last_activity_at}.`);
   if (defaultBudget !== null || defaultProduct) {
-    lines.push(`Default run: ${defaultBudget === null ? "saved budget" : `$${defaultBudget.toFixed(2)}`} ${defaultProduct || "run"}; use included run when available: ${defaults.use_free_run_when_available === false ? "no" : "yes"}.`);
+    const freeRunPreference = defaults.use_free_run_when_available === true ? "yes" : defaults.use_free_run_when_available === false ? "no" : "unavailable";
+    lines.push(`Default run: ${defaultBudget === null ? "saved budget" : `$${defaultBudget.toFixed(2)}`} ${defaultProduct || "run"}; use included run when available: ${freeRunPreference}.`);
   } else {
     lines.push("Saved defaults: unavailable.");
   }
   lines.push(`Uninterrupted paid runs: ${data.billing_configured_for_uninterrupted_runs === true ? "configured" : "not configured"}.`);
+  if (typeof data.can_start_default_run === "boolean") {
+    lines.push(`Saved default run ready now: ${data.can_start_default_run ? "yes" : "no"}.`);
+  }
+  if (typeof data.can_start_any_onboarding_run === "boolean") {
+    lines.push(`At least one fully funded $1+ onboarding run ready now: ${data.can_start_any_onboarding_run ? "yes" : "no"}.`);
+  }
+  if (typeof data.can_start_standard_onboarding_run === "boolean") {
+    lines.push(`Standard $5 onboarding run ready now: ${data.can_start_standard_onboarding_run ? "yes" : "no"}.`);
+  }
   return lines.join("\n");
 }
 function healthTextSummary(data = {}) {
@@ -25221,9 +25715,9 @@ Webhound uses the budget for extraction depth; $1 buys about 15 minutes of resea
   });
   registerTool(server2, client, "webhound_onboarding", {
     title: "Webhound Onboarding",
-    description: "No-spend compact, client-aware first-run guide. It returns one message, choices, and one next action. Hosted clients never write workspace rules unless the user explicitly requests that separate action.",
+    description: "No-spend, client-aware guided onboarding. Local agents receive the full setup-first versus jump-in flow; hosted clients receive a research-first flow with no filesystem setup unless the user explicitly requests approval-gated workspace-rule guidance. Budget maps to about 15 minutes per $1: $5 is about 75 minutes and $20 is about 300 minutes (5 hours). The $2/$5/$10/$20 tiers are starting points, not caps.",
     inputSchema: {
-      client: external_exports.enum(ONBOARDING_CLIENTS).default("generic"),
+      client: external_exports.enum(ONBOARDING_CLIENTS).default("generic").describe("Identify the calling agent when known. Omitted or generic callers receive the research-first, filesystem-safe flow."),
       capabilities: external_exports.object({
         workspace_rules_supported: external_exports.boolean().optional()
       }).passthrough().optional(),
@@ -25231,8 +25725,8 @@ Webhound uses the budget for extraction depth; $1 buys about 15 minutes of resea
     },
     annotations: { readOnlyHint: true, openWorldHint: false }
   }, async (args2) => {
-    const data = compactOnboarding(await client.onboarding(), args2);
-    return jsonResult(data.message, data);
+    const data = clientAwareOnboarding(await client.onboarding(), args2);
+    return jsonResult("Webhound onboarding is ready. Send immediate_next_message once, then follow agent_playbook.conversation_flow.", data);
   });
   registerTool(server2, client, "webhound_help", {
     title: "Webhound Help",
@@ -25266,11 +25760,11 @@ Webhound uses the budget for extraction depth; $1 buys about 15 minutes of resea
   }, async () => jsonResult("Current Webhound MCP defaults.", await client.getDefaults()));
   registerTool(server2, client, "webhound_set_defaults", {
     title: "Set Webhound MCP Defaults",
-    description: "Set default budget/product/free-run behavior for future MCP runs. The MCP always uses Hound. Recommended: $5 and use the free run when available. Do not use this for private workspace-derived rules; save those locally in the agent workspace.",
+    description: "Update only the provided default budget/product/free-run fields for future MCP runs; omitted fields keep their saved values. The MCP always uses Hound. Do not use this for private workspace-derived rules; save those locally in the agent workspace.",
     inputSchema: {
-      default_budget_usd: external_exports.number().min(1).max(500).default(5),
-      default_product: external_exports.enum(["report", "dataset"]).default("report"),
-      use_free_run_when_available: external_exports.boolean().default(true)
+      default_budget_usd: external_exports.number().min(1).max(500).optional(),
+      default_product: external_exports.enum(["report", "dataset"]).optional(),
+      use_free_run_when_available: external_exports.boolean().optional()
     }
   }, async (args2) => jsonResult("Webhound MCP defaults saved.", await client.setDefaults(args2)));
   registerTool(server2, client, "webhound_start_report", {

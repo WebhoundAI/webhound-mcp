@@ -276,15 +276,41 @@ function publicOnboarding(value = {}) {
   const onboarding = { ...(value || {}) };
   if (onboarding.account_state) {
     const billing = onboarding.billing || {};
-    const credits = Number(billing.credits || onboarding.account_state.credits || 0);
+    const credits = Number(billing.credits ?? onboarding.account_state.credit_balance_usd ?? onboarding.account_state.credits ?? 0);
+    const availableCreditsValue = Number(billing.available_credits ?? onboarding.account_state.available_credit_balance_usd);
+    const creditAvailabilityVerified = (
+      billing.credit_availability_verified === true
+      || onboarding.account_state.credit_availability_verified === true
+    ) && Number.isFinite(availableCreditsValue) && availableCreditsValue >= 0;
+    const availableCredits = creditAvailabilityVerified ? availableCreditsValue : 0;
     const uninterrupted = billing.has_card_on_file === true
       && billing.auto_recharge_enabled === true
       && billing.auto_recharge_blocked !== true;
+    const defaults = publicDefaults(onboarding.account_state.defaults);
+    const freeRun = publicFreeRun(onboarding.account_state.free_run || onboarding.free_run);
+    const savedDefaultBudget = Number(defaults.default_budget_usd);
+    const savedDefaultBudgetKnown = Number.isFinite(savedDefaultBudget) && savedDefaultBudget > 0;
+    const includedRunReady = freeRun.available === true
+      && defaults.use_free_run_when_available === true
+      && onboarding.account_state.included_run_auto_use_enabled !== false;
+    const anyPaidRunReady = availableCredits >= 1 || uninterrupted;
+    const standardPaidRunReady = availableCredits >= 5 || uninterrupted;
+    const paidRunReady = uninterrupted || (savedDefaultBudgetKnown && availableCredits >= savedDefaultBudget);
     onboarding.account_state = {
       ...onboarding.account_state,
-      defaults: publicDefaults(onboarding.account_state.defaults),
-      free_run: publicFreeRun(onboarding.account_state.free_run),
-      can_start_default_paid_run: credits >= 5,
+      defaults,
+      free_run: freeRun,
+      credit_balance_usd: credits,
+      available_credit_balance_usd: availableCredits,
+      credit_availability_verified: creditAvailabilityVerified,
+      included_run_auto_use_enabled: includedRunReady,
+      can_start_default_paid_run: paidRunReady,
+      can_start_default_run: paidRunReady || (includedRunReady && savedDefaultBudget === 5),
+      can_start_any_onboarding_paid_run: anyPaidRunReady,
+      can_start_any_onboarding_run: anyPaidRunReady || includedRunReady,
+      can_start_standard_onboarding_paid_run: standardPaidRunReady,
+      can_start_standard_onboarding_run: standardPaidRunReady || includedRunReady,
+      minimum_supported_budget_usd: 1,
       billing_configured_for_uninterrupted_runs: uninterrupted,
     };
     delete onboarding.account_state.ready_for_paid_runs;
@@ -1245,24 +1271,52 @@ export class WebhoundApiClient {
       this.get('/mcp/free-run').catch(() => null),
       this.get('/mcp/defaults').catch(() => null),
     ]);
-    const creditBalance = Number(credits?.credits ?? credits?.balance ?? credits?.current_balance ?? 0);
+    const availableCreditBalance = Number(credits?.available_credits);
+    const creditAvailabilityVerified = credits?.credit_availability_verified === true
+      && Number.isFinite(availableCreditBalance)
+      && availableCreditBalance >= 0;
+    const creditBalance = creditAvailabilityVerified ? availableCreditBalance : 0;
+    const totalCreditBalance = Number(credits?.credits ?? credits?.balance ?? credits?.current_balance ?? 0);
+    const reservedCreditBalance = Number(credits?.reserved_credits ?? 0);
     const uninterrupted = credits?.has_card_on_file === true
       && credits?.auto_recharge_enabled === true
       && credits?.auto_recharge_blocked !== true;
+    const normalizedFreeRun = freeRun ? publicFreeRun(freeRun.free_run || freeRun) : null;
+    const normalizedDefaults = defaults ? publicDefaults(defaults.defaults || defaults) : null;
+    const savedDefaultBudget = Number(normalizedDefaults?.default_budget_usd);
+    const savedDefaultBudgetKnown = Number.isFinite(savedDefaultBudget) && savedDefaultBudget > 0;
+    const includedRunReady = normalizedFreeRun?.available === true
+      && normalizedDefaults?.use_free_run_when_available === true;
+    const anyPaidRunReady = creditBalance >= 1 || uninterrupted;
+    const standardPaidRunReady = creditBalance >= 5 || uninterrupted;
+    const paidRunReady = uninterrupted || (savedDefaultBudgetKnown && creditBalance >= savedDefaultBudget);
+    const includedRunFundsSavedDefault = includedRunReady && savedDefaultBudget === 5;
     return {
       credits,
       usage,
-      free_run: freeRun ? publicFreeRun(freeRun.free_run || freeRun) : null,
-      defaults: defaults ? publicDefaults(defaults.defaults || defaults) : null,
-      can_start_default_paid_run: creditBalance >= 5,
+      free_run: normalizedFreeRun,
+      defaults: normalizedDefaults,
+      credit_balance_usd: Number.isFinite(totalCreditBalance) ? totalCreditBalance : 0,
+      available_credit_balance_usd: creditBalance,
+      reserved_credit_balance_usd: Number.isFinite(reservedCreditBalance) ? Math.max(0, reservedCreditBalance) : 0,
+      credit_availability_verified: creditAvailabilityVerified,
+      can_start_default_paid_run: paidRunReady,
+      can_start_default_run: paidRunReady || includedRunFundsSavedDefault,
+      can_start_any_onboarding_paid_run: anyPaidRunReady,
+      can_start_any_onboarding_run: anyPaidRunReady || includedRunReady,
+      can_start_standard_onboarding_paid_run: standardPaidRunReady,
+      can_start_standard_onboarding_run: standardPaidRunReady || includedRunReady,
+      minimum_supported_budget_usd: 1,
       billing_configured_for_uninterrupted_runs: uninterrupted,
     };
   }
 
   async startReport(args) {
     const contextSessionIds = await this.validateContextSessions(args.context_session_ids);
-    const defaults = await this.getDefaults().catch(() => ({}));
-    const budget = Number(args.budget ?? defaults.default_budget_usd ?? 5);
+    const defaults = await this.getDefaults().catch(() => null);
+    const budget = Number(args.budget ?? defaults?.default_budget_usd ?? 5);
+    const useFreeRunWhenAvailable = args.use_free_run_when_available
+      ?? (defaults?.use_free_run_when_available === true);
     const result = await this.postMutation('/research', {
       title: args.title || titleFromPrompt(args.prompt),
       query: args.prompt,
@@ -1273,15 +1327,17 @@ export class WebhoundApiClient {
       context_session_ids: contextSessionIds.length > 0 ? contextSessionIds : undefined,
       file_ids: args.file_ids || undefined,
       enable_checkpoints: args.enable_checkpoints,
-      use_free_run_when_available: args.use_free_run_when_available ?? defaults.use_free_run_when_available ?? true,
+      use_free_run_when_available: useFreeRunWhenAvailable,
     }, 'Search/list recent sessions and inspect account usage for a matching title before retrying. Retry only after confirming no session was created.');
     return publicStartResult(result);
   }
 
   async startDataset(args) {
     const contextSessionIds = await this.validateContextSessions(args.context_session_ids);
-    const defaults = await this.getDefaults().catch(() => ({}));
-    const budget = Number(args.budget ?? defaults.default_budget_usd ?? 5);
+    const defaults = await this.getDefaults().catch(() => null);
+    const budget = Number(args.budget ?? defaults?.default_budget_usd ?? 5);
+    const useFreeRunWhenAvailable = args.use_free_run_when_available
+      ?? (defaults?.use_free_run_when_available === true);
     const normalizedSchema = normalizeDatasetSchema(args.schema);
     const result = await this.postMutation('/extractions', {
       title: args.title || titleFromPrompt(args.prompt),
@@ -1293,7 +1349,7 @@ export class WebhoundApiClient {
       context_session_ids: contextSessionIds.length > 0 ? contextSessionIds : undefined,
       file_ids: args.file_ids || undefined,
       enable_checkpoints: args.enable_checkpoints,
-      use_free_run_when_available: args.use_free_run_when_available ?? defaults.use_free_run_when_available ?? true,
+      use_free_run_when_available: useFreeRunWhenAvailable,
     }, 'Search/list recent sessions and inspect account usage for a matching dataset title before retrying. Retry only after confirming no extraction was created.');
     const publicResult = publicStartResult(result);
     return {

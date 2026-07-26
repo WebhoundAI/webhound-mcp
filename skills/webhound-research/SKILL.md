@@ -24,23 +24,37 @@ doing more research. Use a quicker tool for simple factual lookups.
 
 ## Before starting
 
-1. If the Webhound server needs authentication, ask the user to complete the
-   client's Webhound OAuth flow. The authorization page accepts that user's own
-   Webhound API key and exchanges it for a scoped MCP token.
+1. If the hosted Webhound server needs authentication, ask the user to complete
+   Webhound sign-in and consent in the client's OAuth flow. Each person connects
+   their own Webhound account. Local stdio installs instead use that user's own
+   generated Webhound API key.
 2. Confirm the research question, desired artifact, and dollar budget. Starting
    a report, dataset, or budget extension can spend money, so do not invent or
    silently increase a budget.
 3. Use a report for a cited argument, comparison, map, or recommendation. Use a
    dataset for rows, fields, and per-field provenance.
-4. If the user wants guidance, suggest $2 for scouting, $5 for normal cited
-   research, or $10 for deeper decision-driving work. Treat those as suggestions,
-   not permission. Roughly, $1 buys about 15 minutes of research; this is a
-   changing rule of thumb, not a guarantee.
+4. If the user wants guidance, recommend $2 for quick scouting, $5 for normal
+   cited research, $10 for deep work, or $20 for exhaustive/highest-stakes work.
+   These are starting points, not caps or permission to spend; the user can
+   choose a larger custom budget for longer, deeper research. Roughly, $1 buys
+   about 15 minutes, so $5 is about 75 minutes and $20 is about 300 minutes
+   (five hours). Actual runtime still varies.
 5. A new account may have one indivisible free run for one exact $5 report or
-   dataset. Check account or onboarding status rather than promising it.
+   dataset. Check account or onboarding status rather than promising it. Honor
+   the saved preference: use it automatically only when enabled, or after the
+   user explicitly consents to use it for this exact $5 run.
 
-Use `webhound_onboarding`, `webhound_account`, or `webhound_help` when setup or
-account state is unclear.
+When the user asks to onboard, call `webhound_onboarding` once, send its
+`immediate_next_message` exactly once, and treat
+`agent_playbook.conversation_flow` as the canonical sequence. The entry whose
+`say` matches the message already sent is consumed; after the user replies,
+continue with the next unconsumed entry. Treat `setup_flow` as reference-only
+and `next_action` as the entry instruction, not additional sequences. Do not
+repeatedly call onboarding to advance it. Continue the first run through
+`done=true`, then return its output with sources and provenance. Drop onboarding
+immediately if the user changes the subject.
+Use `webhound_account` or `webhound_help` when account state or product behavior
+is unclear.
 
 ## Run the investigation
 

@@ -94,7 +94,7 @@ Create a Webhound API key, then add the stdio server to your agent:
   "mcpServers": {
     "webhound": {
       "command": "npx",
-      "args": ["-y", "webhound-mcp@0.5.2"],
+      "args": ["-y", "webhound-mcp@0.5.3"],
       "env": {
         "WEBHOUND_KEY": "wh_..."
       }
@@ -134,9 +134,15 @@ Save, sign in to Webhound, approve the connection, then start a new Manus task
 and send:
 
 ```text
-Call webhound_onboarding with client set to hosted. Send its message exactly
-once, present its choices, and follow its next_action one step at a time. Do
-not create or edit workspace rules unless I explicitly ask.
+Call webhound_onboarding once with client set to hosted. Send its
+immediate_next_message exactly once. Treat agent_playbook.conversation_flow as
+the canonical sequence; the matching first entry is already consumed, so after
+I reply continue with the next unconsumed entry. setup_flow is reference-only
+and next_action is only the entry instruction. Do not repeatedly call
+onboarding to advance it. Continue the first run through done=true and return
+the output with sources and provenance. If I change the subject, drop
+onboarding immediately. Do not create or edit workspace rules unless I
+explicitly ask.
 ```
 
 Other hosted clients should use the same server URL with OAuth when supported.
@@ -149,7 +155,7 @@ Claude Code:
 claude mcp add --transport http webhound https://api.webhound.ai/api/v2/mcp
 
 # Local stdio alternative:
-claude mcp add --transport stdio webhound --env WEBHOUND_KEY=wh_... -- npx -y webhound-mcp@0.5.2
+claude mcp add --transport stdio webhound --env WEBHOUND_KEY=wh_... -- npx -y webhound-mcp@0.5.3
 ```
 
 Codex:
@@ -157,7 +163,7 @@ Codex:
 ```toml
 [mcp_servers.webhound]
 command = "npx"
-args = ["-y", "webhound-mcp@0.5.2"]
+args = ["-y", "webhound-mcp@0.5.3"]
 
 [mcp_servers.webhound.env]
 WEBHOUND_KEY = "wh_..."
@@ -188,7 +194,7 @@ VS Code:
     "webhound": {
       "type": "stdio",
       "command": "npx",
-      "args": ["-y", "webhound-mcp@0.5.2"],
+      "args": ["-y", "webhound-mcp@0.5.3"],
       "env": {
         "WEBHOUND_KEY": "wh_..."
       }
@@ -217,12 +223,22 @@ Recommended setup defaults:
 
 - budget: `$5`
 - product: `report`
-- free run: enabled when available
+- free run: honor the saved preference; use automatically only when enabled, or
+  after explicit one-run consent for an exact `$5` report or dataset
 
-`webhound_onboarding` returns one client-aware message, choices, and one next
-action. Hosted clients such as Manus must not create or edit workspace rules
-unless the user explicitly requests that separate action. Starting a report or
-dataset never triggers workspace-rule setup.
+As a rule of thumb, `$1` buys about 15 minutes of research, so the `$5`
+default is about 75 minutes. Recommended starting points are `$2` quick, `$5`
+standard, `$10` deep, and `$20` exhaustive/highest-stakes (about 300 minutes
+or five hours). These are not caps; users can choose a larger custom budget or
+say how long they want Webhound to research, using about `$1` per 15 minutes.
+
+`webhound_onboarding` returns the client-aware guided first-run flow, including
+account and included-run state, the budget model, setup-first versus jump-in,
+report-versus-dataset guidance, waiting through `done=true`, provenance,
+export, and billing follow-up. Hosted clients such as Manus receive the full
+research flow but no workspace-writing flow unless the user explicitly
+requests that separate action. Starting a normal report or dataset never
+triggers workspace-rule setup.
 
 New users may have one non-divisible free run pass. It covers one exact `$5` report or dataset. It can be used from the Webhound UI, API, hosted MCP, or this stdio MCP package.
 
