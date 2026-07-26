@@ -142,7 +142,7 @@ function prependUnreferencedZipBytes(buffer, prefix = Buffer.from('PK\x03\x04'))
 }
 
 test('version and complete tool inventory are stable', () => {
-  assert.equal(VERSION, '0.5.1');
+  assert.equal(VERSION, '0.5.2');
   assert.equal(TOOL_NAMES.length, 30);
   assert.equal(new Set(TOOL_NAMES).size, 30);
 });

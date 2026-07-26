@@ -22781,7 +22781,7 @@ var WebhoundApiClient = class {
 };
 
 // core/server.mjs
-var VERSION = "0.5.1";
+var VERSION = "0.5.2";
 var BILLING_URL = "https://www.webhound.ai/billing";
 var MCP_RESOURCE_METADATA_URL = process.env.WEBHOUND_MCP_RESOURCE_METADATA_URL || "https://api.webhound.ai/.well-known/oauth-protected-resource/api/v2/mcp";
 var STRUCTURED_CONTENT_VERSION = "webhound-mcp-0.5";
@@ -24149,7 +24149,11 @@ function buildHelp(topic, question = "") {
     related_topics: HELP_TOPICS.filter((item) => item !== resolvedTopic).slice(0, 6)
   };
 }
-function compactOnboarding(data = {}, { client = "generic", capabilities = {} } = {}) {
+function compactOnboarding(data = {}, {
+  client = "generic",
+  capabilities = {},
+  workspace_rules_requested = false
+} = {}) {
   const resolvedClient = ONBOARDING_CLIENTS.includes(client) ? client : "generic";
   const hosted = resolvedClient === "hosted" || resolvedClient === "manus";
   const account = data.account_state || {};
@@ -24160,12 +24164,12 @@ function compactOnboarding(data = {}, { client = "generic", capabilities = {} } 
   );
   const canStart = account.can_start_default_paid_run === true || account.ready_for_included_run === true || freeRun.available === true || credits >= 5;
   const uninterrupted = account.billing_configured_for_uninterrupted_runs === true;
-  const message = canStart ? "What should your first Webhound run produce: a cited report or a sourced dataset?" : `This account has $${credits.toFixed(2)} in credits and no available included run. Add credits or connect billing, then tell me when it is ready.`;
+  const message = canStart ? "Webhound is connected. If you want to try it now, choose a cited report or a sourced dataset. You can also ask another Webhound question instead; onboarding is not a pending task." : `This account has $${credits.toFixed(2)} in credits and no available included run. Add credits or connect billing, then tell me when it is ready.`;
   const choices = canStart ? [
     { id: "report", label: "Cited report", next_tool: "webhound_start_report" },
     { id: "dataset", label: "Sourced dataset", next_tool: "webhound_start_dataset" }
   ] : [{ id: "billing_ready", label: "Billing is ready", next_tool: "webhound_account" }];
-  return {
+  const result = {
     flow_id: "webhound-first-run",
     flow_version: 1,
     client: resolvedClient,
@@ -24173,7 +24177,7 @@ function compactOnboarding(data = {}, { client = "generic", capabilities = {} } 
     step: canStart ? "choose_first_artifact" : "unblock_billing",
     message,
     choices,
-    next_action: canStart ? "Ask the message exactly once and wait for the user answer." : "Send the billing link, wait for confirmation, then call webhound_account before starting.",
+    next_action: canStart ? "Offer the two choices once. If the user asks a different question, immediately drop this onboarding step and answer that question without mentioning pending onboarding. Resume only if the user explicitly asks to continue setup." : "Send the billing link once. If the user asks a different question, answer it without repeating onboarding. Recheck webhound_account only after the user says billing is ready.",
     account_state: {
       authenticated: account.authenticated !== false,
       credit_balance_usd: credits,
@@ -24186,14 +24190,91 @@ function compactOnboarding(data = {}, { client = "generic", capabilities = {} } 
       default_product: data.recommended_defaults?.default_product || "report",
       use_free_run_when_available: data.recommended_defaults?.use_free_run_when_available !== false
     },
-    billing_url: canStart ? null : BILLING_URL,
-    workspace_rules: {
-      supported: capabilities.workspace_rules_supported === true,
-      requested: false,
-      instruction: hosted ? "Do not create or edit workspace rules unless the user explicitly requests that separate action." : "Do not create or edit workspace rules during onboarding unless the user explicitly requests that separate action.",
-      validation_if_explicitly_requested: "Show the complete proposed content and exact destination before writing; after approval, read it back and reject an empty or frontmatter-only file."
-    }
+    billing_url: canStart ? null : BILLING_URL
   };
+  if (workspace_rules_requested === true) {
+    result.workspace_rules = {
+      supported: capabilities.workspace_rules_supported === true,
+      requested: true,
+      instruction: hosted ? "The user explicitly requested workspace-rule guidance. Ask for the exact destination before proposing or writing anything." : "The user explicitly requested workspace-rule guidance. Ask for the exact destination before proposing or writing anything.",
+      validation_if_explicitly_requested: "Show the complete proposed content and exact destination before writing; after approval, read it back and reject an empty or frontmatter-only file."
+    };
+  }
+  return result;
+}
+function finiteNumber(...values) {
+  for (const value of values) {
+    if (value === null || value === void 0 || value === "" || typeof value === "boolean") continue;
+    const number3 = Number(value);
+    if (Number.isFinite(number3)) return number3;
+  }
+  return null;
+}
+function creditBalanceFrom(data = {}) {
+  const credits = data.credits;
+  return finiteNumber(
+    typeof credits === "number" ? credits : void 0,
+    credits?.credits,
+    credits?.balance,
+    credits?.current_balance,
+    data.credit_balance_usd
+  );
+}
+function accountTextSummary(data = {}) {
+  const balance = creditBalanceFrom(data);
+  const usage = data.usage || {};
+  const periodDays = finiteNumber(usage.period_days);
+  const totalCost = finiteNumber(usage.total_cost);
+  const sessionCount = finiteNumber(usage.session_count);
+  const operationCount = finiteNumber(usage.operation_count);
+  const defaults = data.defaults || {};
+  const defaultBudget = finiteNumber(defaults.default_budget_usd);
+  const defaultProduct = String(defaults.default_product || "").trim();
+  const lines = [
+    "Webhound account:",
+    `Credit balance: ${balance === null ? "unavailable" : `$${balance.toFixed(2)}`}.`,
+    `Included $5 run: ${data.free_run?.available === true ? "available" : data.free_run ? "not available" : "unavailable"}.`
+  ];
+  if (totalCost !== null || sessionCount !== null || operationCount !== null) {
+    const period = periodDays === null ? "Recent usage" : `Last ${Math.round(periodDays)} days`;
+    const details = [
+      totalCost === null ? null : `$${totalCost.toFixed(2)} spent`,
+      sessionCount === null ? null : `${Math.round(sessionCount)} sessions`,
+      operationCount === null ? null : `${Math.round(operationCount)} operations`
+    ].filter(Boolean).join(", ");
+    lines.push(`${period}: ${details}.`);
+  } else {
+    lines.push("Recent usage: unavailable.");
+  }
+  if (usage.last_activity_at) lines.push(`Last activity: ${usage.last_activity_at}.`);
+  if (defaultBudget !== null || defaultProduct) {
+    lines.push(`Default run: ${defaultBudget === null ? "saved budget" : `$${defaultBudget.toFixed(2)}`} ${defaultProduct || "run"}; use included run when available: ${defaults.use_free_run_when_available === false ? "no" : "yes"}.`);
+  } else {
+    lines.push("Saved defaults: unavailable.");
+  }
+  lines.push(`Uninterrupted paid runs: ${data.billing_configured_for_uninterrupted_runs === true ? "configured" : "not configured"}.`);
+  return lines.join("\n");
+}
+function healthTextSummary(data = {}) {
+  const balance = creditBalanceFrom(data);
+  const defaults = data.defaults || {};
+  const defaultBudget = finiteNumber(defaults.default_budget_usd);
+  const defaultProduct = String(defaults.default_product || "").trim();
+  const lines = [
+    data.mcp_ready ? "Webhound MCP is ready." : "Webhound MCP is not ready.",
+    `API reachable: ${data.api_reachable === true ? "yes" : "no"}.`,
+    `Authenticated: ${data.authenticated === true ? "yes" : "no"}.`,
+    `Credit balance: ${balance === null ? "unavailable" : `$${balance.toFixed(2)}`}.`,
+    `Included $5 run: ${data.free_run?.available === true ? "available" : data.free_run ? "not available" : "unavailable"}.`
+  ];
+  if (defaultBudget !== null || defaultProduct) {
+    lines.push(`Default run: ${defaultBudget === null ? "saved budget" : `$${defaultBudget.toFixed(2)}`} ${defaultProduct || "run"}.`);
+  }
+  if (data.mcp?.version) lines.push(`MCP version: ${data.mcp.version}; tools: ${Array.isArray(data.mcp.tools) ? data.mcp.tools.length : "unavailable"}.`);
+  if (Array.isArray(data.errors) && data.errors.length > 0) {
+    lines.push(`Failed checks: ${data.errors.map((error2) => error2.service).filter(Boolean).join(", ") || "see structured diagnostics"}.`);
+  }
+  return lines.join("\n");
 }
 var UNINSTALL_GUIDANCE_BY_CLIENT = Object.freeze({
   cursor: {
@@ -24298,12 +24379,11 @@ function jsonResultWithOptions(summary, data, options = {}) {
     schema_version: STRUCTURED_CONTENT_VERSION,
     summary: String(summary || "")
   };
-  const content = [{ type: "text", text: summary }];
-  if (options.includeJsonText === true) {
-    content.push({ type: "text", text: JSON.stringify(structured, null, 2) });
-  }
   return {
-    content,
+    // MCP clients are inconsistent about whether structuredContent is exposed
+    // to the model. Keep the text fallback as an exact serialization of the
+    // canonical typed result so no client sees a summary without the facts.
+    content: [{ type: "text", text: JSON.stringify(structured, null, 2) }],
     structuredContent: structured,
     isError: !!options.isError,
     ...options._meta ? { _meta: options._meta } : {}
@@ -25027,6 +25107,7 @@ function normalizeToolResult(name, result) {
   assertSemanticToolResult(name, parsed.data);
   return {
     ...result,
+    content: [{ type: "text", text: JSON.stringify(parsed.data, null, 2) }],
     structuredContent: parsed.data
   };
 }
@@ -25135,7 +25216,7 @@ Webhound uses the budget for extraction depth; $1 buys about 15 minutes of resea
   }, async () => {
     const data = await client.health();
     data.mcp = { version: VERSION, tools: TOOL_NAMES };
-    const summary = data.mcp_ready ? "Webhound MCP is ready, the API is reachable, and authentication succeeded." : `Webhound MCP is not ready: api_reachable=${data.api_reachable}; authenticated=${data.authenticated}.`;
+    const summary = healthTextSummary(data);
     return jsonResult(summary, data, !data.mcp_ready);
   });
   registerTool(server2, client, "webhound_onboarding", {
@@ -25145,7 +25226,8 @@ Webhound uses the budget for extraction depth; $1 buys about 15 minutes of resea
       client: external_exports.enum(ONBOARDING_CLIENTS).default("generic"),
       capabilities: external_exports.object({
         workspace_rules_supported: external_exports.boolean().optional()
-      }).passthrough().optional()
+      }).passthrough().optional(),
+      workspace_rules_requested: external_exports.boolean().default(false).describe("Set true only when the user explicitly asks for workspace-rule guidance as a separate action.")
     },
     annotations: { readOnlyHint: true, openWorldHint: false }
   }, async (args2) => {
@@ -25713,7 +25795,10 @@ Webhound uses the budget for extraction depth; $1 buys about 15 minutes of resea
     description: "Read credits, recent usage, free-run status, and defaults. Does not spend.",
     inputSchema: {},
     annotations: { readOnlyHint: true, openWorldHint: false }
-  }, async () => jsonResult("Webhound account status.", await client.account()));
+  }, async () => {
+    const data = await client.account();
+    return jsonResult(accountTextSummary(data), data);
+  });
   registerTool(server2, client, "webhound_diagnose", {
     title: "Diagnose Webhound Session",
     description: "Explain whether a session is healthy, done, usable, and what to do next. For a healthy running session, the correct next action is to keep waiting; budget use is the point of the run. Do not stop or force finalization because the run is slow.",

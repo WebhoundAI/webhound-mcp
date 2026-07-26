@@ -16,6 +16,14 @@ async function connectedClient(fakeClient) {
   const client = new Client({ name: 'webhound-contract-test', version: '1.0.0' });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+  const callTool = client.callTool.bind(client);
+  client.callTool = async (...args) => {
+    const result = await callTool(...args);
+    if (result?.structuredContent) {
+      assertTextContentParity(result, args[0]?.name || 'tools/call');
+    }
+    return result;
+  };
   return {
     client,
     async close() {
@@ -32,6 +40,18 @@ function baseFake(overrides = {}) {
     webUrl(sessionId) { return `https://webhound.ai/session/${sessionId}`; },
     ...overrides,
   };
+}
+
+function assertTextContentParity(result, label = 'tool result') {
+  assert.equal(result.content?.length, 1, `${label}: expected one text content item`);
+  assert.equal(result.content?.[0]?.type, 'text', `${label}: expected text content`);
+  let parsed;
+  assert.doesNotThrow(() => {
+    parsed = JSON.parse(result.content[0].text);
+  }, `${label}: text content must be valid JSON`);
+  const normalizedStructuredContent = JSON.parse(JSON.stringify(result.structuredContent));
+  assert.deepEqual(parsed, normalizedStructuredContent, `${label}: text content differs from structuredContent after JSON normalization`);
+  return parsed;
 }
 
 test('all 30 tools publish additive inputs and dedicated closed output contracts', async (t) => {
@@ -229,6 +249,7 @@ test('all 30 tool handlers execute a schema-valid mocked happy path', async (t) 
     assert.equal(result.isError, false, `${name}: ${result.content?.[0]?.text || 'unexpected error'}`);
     assert.equal(result.structuredContent?.tool, name, `${name}: missing dedicated structured output`);
     assert.equal(result.structuredContent?.ok, true, `${name}: not ok`);
+    assertTextContentParity(result, name);
   }
 });
 
@@ -381,6 +402,11 @@ test('degraded health and account probes preserve useful partial responses', asy
   assert.equal(health.structuredContent.defaults, null);
   assert.equal(health.structuredContent.free_run, null);
   assert.equal(health.structuredContent.errors.length, 2);
+  const healthText = assertTextContentParity(health, 'webhound_health degraded fallback');
+  assert.equal(healthText.mcp_ready, true);
+  assert.equal(healthText.api_reachable, true);
+  assert.equal(healthText.authenticated, true);
+  assert.equal(healthText.errors.length, 2);
 
   const account = await connection.client.callTool({
     name: 'webhound_account',
@@ -391,6 +417,10 @@ test('degraded health and account probes preserve useful partial responses', asy
   assert.equal(account.structuredContent.defaults, null);
   assert.equal(account.structuredContent.free_run, null);
   assert.equal(account.structuredContent.credits.credits, 10);
+  const accountText = assertTextContentParity(account, 'webhound_account degraded fallback');
+  assert.equal(accountText.authenticated, true);
+  assert.equal(accountText.credits.credits, 10);
+  assert.equal(accountText.usage.operation_count, 1);
 });
 
 test('MCP dataset input accepts every backend-supported native field and alias', async (t) => {
@@ -1257,7 +1287,8 @@ test('hosted onboarding is compact and start responses contain no rule-writing p
   });
   assert.equal(onboarding.structuredContent.client_mode, 'hosted_oauth');
   assert.equal(onboarding.structuredContent.agent_playbook, undefined);
-  assert.equal(onboarding.structuredContent.workspace_rules.requested, false);
+  assert.equal(onboarding.structuredContent.workspace_rules, undefined);
+  assert.match(onboarding.structuredContent.next_action, /drop this onboarding step/i);
 
   const started = await connection.client.callTool({
     name: 'webhound_start_report',
@@ -1293,8 +1324,23 @@ test('onboarding tolerates additive top-level and nested capability fields', asy
     },
   });
   assert.equal(result.isError, false);
-  assert.equal(result.structuredContent.workspace_rules.supported, true);
+  assert.equal(result.structuredContent.workspace_rules, undefined);
   assert.equal(result.structuredContent.client_mode, 'hosted_oauth');
+
+  const explicitlyRequested = await connection.client.callTool({
+    name: 'webhound_onboarding',
+    arguments: {
+      client: 'hosted',
+      workspace_rules_requested: true,
+      capabilities: {
+        workspace_rules_supported: true,
+      },
+    },
+  });
+  assert.equal(explicitlyRequested.isError, false);
+  assert.equal(explicitlyRequested.structuredContent.workspace_rules.requested, true);
+  assert.equal(explicitlyRequested.structuredContent.workspace_rules.supported, true);
+  assert.match(explicitlyRequested.structuredContent.workspace_rules.instruction, /exact destination/i);
 });
 
 test('onboarding preserves account-state credits when billing has no balance', async (t) => {

@@ -94,7 +94,7 @@ Create a Webhound API key, then add the stdio server to your agent:
   "mcpServers": {
     "webhound": {
       "command": "npx",
-      "args": ["-y", "webhound-mcp@0.5.1"],
+      "args": ["-y", "webhound-mcp@0.5.2"],
       "env": {
         "WEBHOUND_KEY": "wh_..."
       }
@@ -149,7 +149,7 @@ Claude Code:
 claude mcp add --transport http webhound https://api.webhound.ai/api/v2/mcp
 
 # Local stdio alternative:
-claude mcp add --transport stdio webhound --env WEBHOUND_KEY=wh_... -- npx -y webhound-mcp@0.5.1
+claude mcp add --transport stdio webhound --env WEBHOUND_KEY=wh_... -- npx -y webhound-mcp@0.5.2
 ```
 
 Codex:
@@ -157,7 +157,7 @@ Codex:
 ```toml
 [mcp_servers.webhound]
 command = "npx"
-args = ["-y", "webhound-mcp@0.5.1"]
+args = ["-y", "webhound-mcp@0.5.2"]
 
 [mcp_servers.webhound.env]
 WEBHOUND_KEY = "wh_..."
@@ -188,7 +188,7 @@ VS Code:
     "webhound": {
       "type": "stdio",
       "command": "npx",
-      "args": ["-y", "webhound-mcp@0.5.1"],
+      "args": ["-y", "webhound-mcp@0.5.2"],
       "env": {
         "WEBHOUND_KEY": "wh_..."
       }
